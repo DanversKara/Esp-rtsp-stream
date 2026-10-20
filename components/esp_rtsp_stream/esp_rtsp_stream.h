@@ -81,10 +81,14 @@ class RtspMjpeg : public Component {
 
  protected:
   struct OutputPlan {
-    float scale;
-    int scaled_width;  // after scaling, before rotation
+    float scale;          // PPA scale factor (P4)
+    int target_width;     // exact aspect-preserving size, before rotation
+    int target_height;
+    int scaled_width;     // what the decoder / PPA produces, before rotation
     int scaled_height;
-    int out_width;  // after rotation
+    int stage_width;      // scaled size after rotation
+    int stage_height;
+    int out_width;        // final frame size after rotation
     int out_height;
   };
 
@@ -100,7 +104,9 @@ class RtspMjpeg : public Component {
 
   OutputPlan plan_output_(int src_width, int src_height) const;
   bool decode_frame_(const uint8_t *jpeg, size_t len, int src_width, int src_height);
-  bool ensure_rgb_buffer_(int index, size_t bytes);
+  bool ensure_buffer_(uint8_t *&buf, size_t &capacity, size_t bytes);
+  /// Resizes scaled_ into rgb_[back] if the scaler missed the exact size, and records the frame size.
+  bool finish_frame_(const OutputPlan &plan, int back);
 #ifdef USE_LVGL
   void update_lvgl_canvas_(lv_obj_t *canvas);
 #endif
@@ -166,6 +172,9 @@ class RtspMjpeg : public Component {
   int front_height_{0};
   int front_stride_{0};
   std::atomic<bool> new_frame_{false};
+  // Scaler output awaiting the final exact-size resize.
+  uint8_t *scaled_{nullptr};
+  size_t scaled_capacity_{0};
 
 #ifdef USE_ESP_RTSP_STREAM_HW_JPEG
   jpeg_decoder_handle_t hw_decoder_{nullptr};

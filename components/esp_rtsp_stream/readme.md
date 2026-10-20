@@ -18,7 +18,8 @@ The profile is chosen automatically from the `esp32:` variant/board, so you don'
 | | ESP32-S3 | ESP32-P4 |
 |---|---|---|
 | Decoder | `espressif/esp_new_jpeg` (software, S3 SIMD) | Hardware JPEG engine |
-| Scale / rotate | During decode (down to 1/8, multiples of 8) | PPA (1/16 steps), any size |
+| Scale / rotate | During decode (down to 1/8, multiples of 8) | PPA (1/16 steps) |
+| Exact fit | A final bilinear resize closes the last few pixels | Same |
 | Default `max_fps` | 12 | 25 |
 | Default `max_frame_size` | 256 KB | 1 MB |
 | Recommended stream | 640×480 or 704×576 (D1), MJPEG | Up to 1920×1080 MJPEG, link permitting |

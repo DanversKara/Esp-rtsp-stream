@@ -444,21 +444,59 @@ RtspMjpeg::OutputPlan RtspMjpeg::plan_output_(int src_width, int src_height) con
     scale = std::min({1.0f, static_cast<float>(box_w) / src_width, static_cast<float>(box_h) / src_height});
   }
 
+  // The exact aspect-preserving size. The hardware scalers can only get close to it, so they
+  // aim at the next size up and resize_rgb565() closes the last few pixels.
   OutputPlan plan;
+  plan.target_width = std::max(1, static_cast<int>(src_width * scale + 0.01f));
+  plan.target_height = std::max(1, static_cast<int>(src_height * scale + 0.01f));
 #ifdef USE_ESP_RTSP_STREAM_HW_JPEG
   // PPA scale factors have 1/16 resolution.
-  plan.scale = std::max(1.0f / 16, std::floor(scale * 16) / 16);
+  plan.scale = std::min(1.0f, std::max(1.0f / 16, std::ceil(scale * 16 - 0.01f) / 16));
   plan.scaled_width = static_cast<int>(plan.scale * src_width);
   plan.scaled_height = static_cast<int>(plan.scale * src_height);
 #else
-  // esp_new_jpeg scales by up to 1/8 into dimensions that are multiples of 8.
-  plan.scale = std::max(scale, 1.0f / 8);
-  plan.scaled_width = std::max(8, static_cast<int>(src_width * plan.scale) / 8 * 8);
-  plan.scaled_height = std::max(8, static_cast<int>(src_height * plan.scale) / 8 * 8);
+  // esp_new_jpeg shrinks by up to 8x, into dimensions that are multiples of 8.
+  auto decoder_size = [](int src, int target) {
+    const int size = (std::max(target, (src + 7) / 8) + 7) / 8 * 8;
+    return std::min(src, size);
+  };
+  plan.scale = scale;
+  plan.scaled_width = decoder_size(src_width, plan.target_width);
+  plan.scaled_height = decoder_size(src_height, plan.target_height);
 #endif
-  plan.out_width = swap ? plan.scaled_height : plan.scaled_width;
-  plan.out_height = swap ? plan.scaled_width : plan.scaled_height;
+  plan.stage_width = swap ? plan.scaled_height : plan.scaled_width;
+  plan.stage_height = swap ? plan.scaled_width : plan.scaled_height;
+  plan.out_width = swap ? plan.target_height : plan.target_width;
+  plan.out_height = swap ? plan.target_width : plan.target_height;
   return plan;
+}
+
+/// Bilinear RGB565 (little-endian) resize. Only used for small corrections (ratio at most ~2:1).
+static void resize_rgb565(const uint16_t *src, int src_w, int src_h, int src_stride, uint16_t *dst, int dst_w,
+                          int dst_h) {
+  const uint32_t x_step = dst_w > 1 ? (static_cast<uint32_t>(src_w - 1) << 16) / (dst_w - 1) : 0;
+  const uint32_t y_step = dst_h > 1 ? (static_cast<uint32_t>(src_h - 1) << 16) / (dst_h - 1) : 0;
+  for (int y = 0; y < dst_h; y++) {
+    const uint32_t fy = y * y_step;
+    const int y0 = fy >> 16;
+    const int y1 = std::min(y0 + 1, src_h - 1);
+    const uint32_t wy = (fy >> 8) & 0xFF;
+    const uint16_t *row0 = src + y0 * src_stride;
+    const uint16_t *row1 = src + y1 * src_stride;
+    for (int x = 0; x < dst_w; x++) {
+      const uint32_t fx = x * x_step;
+      const int x0 = fx >> 16;
+      const int x1 = std::min(x0 + 1, src_w - 1);
+      const uint32_t wx = (fx >> 8) & 0xFF;
+      const uint32_t p00 = row0[x0], p01 = row0[x1], p10 = row1[x0], p11 = row1[x1];
+      auto mix = [&](int shift, uint32_t mask) -> uint32_t {
+        const uint32_t top = ((p00 >> shift) & mask) * (256 - wx) + ((p01 >> shift) & mask) * wx;
+        const uint32_t bottom = ((p10 >> shift) & mask) * (256 - wx) + ((p11 >> shift) & mask) * wx;
+        return ((top * (256 - wy) + bottom * wy) >> 16) << shift;
+      };
+      *dst++ = static_cast<uint16_t>(mix(11, 0x1F) | mix(5, 0x3F) | mix(0, 0x1F));
+    }
+  }
 }
 
 uint8_t *RtspMjpeg::alloc_jpeg_buffer_(size_t bytes) {
@@ -474,26 +512,41 @@ uint8_t *RtspMjpeg::alloc_jpeg_buffer_(size_t bytes) {
 
 void RtspMjpeg::free_buffer_(uint8_t *buf) { heap_caps_free(buf); }
 
-bool RtspMjpeg::ensure_rgb_buffer_(int index, size_t bytes) {
-  if (this->rgb_capacity_[index] >= bytes)
+bool RtspMjpeg::ensure_buffer_(uint8_t *&buf, size_t &capacity, size_t bytes) {
+  if (capacity >= bytes)
     return true;
-  this->free_buffer_(this->rgb_[index]);
-  this->rgb_capacity_[index] = 0;
+  this->free_buffer_(buf);
+  capacity = 0;
 #ifdef USE_ESP_RTSP_STREAM_HW_JPEG
+  // Cache-line aligned, as the JPEG engine and PPA require.
   jpeg_decode_memory_alloc_cfg_t cfg = {};
   cfg.buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER;
   size_t allocated = 0;
-  this->rgb_[index] = static_cast<uint8_t *>(jpeg_alloc_decoder_mem(bytes, &cfg, &allocated));
+  buf = static_cast<uint8_t *>(jpeg_alloc_decoder_mem(bytes, &cfg, &allocated));
 #else
   // esp_new_jpeg's SIMD path needs 16-byte aligned output.
   size_t allocated = bytes;
-  this->rgb_[index] = static_cast<uint8_t *>(heap_caps_aligned_calloc(16, 1, bytes, MALLOC_CAP_SPIRAM));
+  buf = static_cast<uint8_t *>(heap_caps_aligned_calloc(16, 1, bytes, MALLOC_CAP_SPIRAM));
 #endif
-  if (this->rgb_[index] == nullptr) {
+  if (buf == nullptr) {
     ESP_LOGE(TAG, "Cannot allocate a %u byte frame buffer", (unsigned) bytes);
     return false;
   }
-  this->rgb_capacity_[index] = allocated;
+  capacity = allocated;
+  return true;
+}
+
+bool RtspMjpeg::finish_frame_(const OutputPlan &plan, int back) {
+  if (plan.stage_width != plan.out_width || plan.stage_height != plan.out_height) {
+    if (!this->ensure_buffer_(this->rgb_[back], this->rgb_capacity_[back],
+                              static_cast<size_t>(plan.out_width) * plan.out_height * 2))
+      return false;
+    resize_rgb565(reinterpret_cast<const uint16_t *>(this->scaled_), plan.stage_width, plan.stage_height,
+                  plan.stage_width, reinterpret_cast<uint16_t *>(this->rgb_[back]), plan.out_width, plan.out_height);
+  }
+  this->back_width_ = plan.out_width;
+  this->back_height_ = plan.out_height;
+  this->back_stride_ = plan.out_width;
   return true;
 }
 
@@ -521,30 +574,12 @@ bool RtspMjpeg::decode_frame_(const uint8_t *jpeg, size_t len, int src_width, in
 
   const OutputPlan plan = this->plan_output_(src_width, src_height);
   const int back = this->front_ ^ 1;
-  const bool direct = this->rotation_ == 0 && plan.scaled_width == src_width && plan.scaled_height == src_height;
+  const bool direct = this->rotation_ == 0 && plan.target_width == src_width && plan.target_height == src_height;
 
-  uint8_t *target;
-  size_t target_capacity;
-  if (direct) {
-    if (!this->ensure_rgb_buffer_(back, decoded_bytes))
-      return false;
-    target = this->rgb_[back];
-    target_capacity = this->rgb_capacity_[back];
-  } else {
-    if (this->staging_capacity_ < decoded_bytes) {
-      this->free_buffer_(this->staging_);
-      jpeg_decode_memory_alloc_cfg_t cfg = {};
-      cfg.buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER;
-      this->staging_ = static_cast<uint8_t *>(jpeg_alloc_decoder_mem(decoded_bytes, &cfg, &this->staging_capacity_));
-      if (this->staging_ == nullptr) {
-        this->staging_capacity_ = 0;
-        ESP_LOGE(TAG, "Cannot allocate a %u byte decode buffer", (unsigned) decoded_bytes);
-        return false;
-      }
-    }
-    target = this->staging_;
-    target_capacity = this->staging_capacity_;
-  }
+  uint8_t *&target = direct ? this->rgb_[back] : this->staging_;
+  size_t &target_capacity = direct ? this->rgb_capacity_[back] : this->staging_capacity_;
+  if (!this->ensure_buffer_(target, target_capacity, decoded_bytes))
+    return false;
 
   jpeg_decode_cfg_t cfg = {};
   cfg.output_format = JPEG_DECODE_OUT_FORMAT_RGB565;
@@ -564,8 +599,13 @@ bool RtspMjpeg::decode_frame_(const uint8_t *jpeg, size_t len, int src_width, in
     return true;
   }
 
-  if (!this->ensure_rgb_buffer_(back, static_cast<size_t>(plan.out_width) * plan.out_height * 2))
+  // PPA writes straight into the frame buffer when it hits the exact size, else into scaled_ for a final resize.
+  const bool exact = plan.stage_width == plan.out_width && plan.stage_height == plan.out_height;
+  uint8_t *&ppa_out = exact ? this->rgb_[back] : this->scaled_;
+  size_t &ppa_out_capacity = exact ? this->rgb_capacity_[back] : this->scaled_capacity_;
+  if (!this->ensure_buffer_(ppa_out, ppa_out_capacity, static_cast<size_t>(plan.stage_width) * plan.stage_height * 2))
     return false;
+
   ppa_srm_oper_config_t op = {};
   op.in.buffer = this->staging_;
   op.in.pic_w = padded_w;
@@ -573,10 +613,10 @@ bool RtspMjpeg::decode_frame_(const uint8_t *jpeg, size_t len, int src_width, in
   op.in.block_w = src_width;
   op.in.block_h = src_height;
   op.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
-  op.out.buffer = this->rgb_[back];
-  op.out.buffer_size = this->rgb_capacity_[back];
-  op.out.pic_w = plan.out_width;
-  op.out.pic_h = plan.out_height;
+  op.out.buffer = ppa_out;
+  op.out.buffer_size = ppa_out_capacity;
+  op.out.pic_w = plan.stage_width;
+  op.out.pic_h = plan.stage_height;
   op.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
   // PPA rotates counter-clockwise; `rotation` is clockwise.
   op.rotation_angle = this->rotation_ == 90    ? PPA_SRM_ROTATION_ANGLE_270
@@ -591,10 +631,7 @@ bool RtspMjpeg::decode_frame_(const uint8_t *jpeg, size_t len, int src_width, in
     ESP_LOGW(TAG, "PPA scale/rotate failed: %s", esp_err_to_name(err));
     return false;
   }
-  this->back_width_ = plan.out_width;
-  this->back_height_ = plan.out_height;
-  this->back_stride_ = plan.out_width;
-  return true;
+  return this->finish_frame_(plan, back);
 }
 
 #else
@@ -629,13 +666,18 @@ bool RtspMjpeg::decode_frame_(const uint8_t *jpeg, size_t len, int src_width, in
       src_height = info.height;
       continue;
     }
+
+    // Decode straight into the frame buffer when the decoder hits the exact size, else into scaled_.
+    const bool exact = plan.stage_width == plan.out_width && plan.stage_height == plan.out_height;
+    uint8_t *&out = exact ? this->rgb_[back] : this->scaled_;
+    size_t &out_capacity = exact ? this->rgb_capacity_[back] : this->scaled_capacity_;
     int out_len = 0;
     if (err == JPEG_ERR_OK)
       err = jpeg_dec_get_outbuf_len(decoder, &out_len);
-    if (err == JPEG_ERR_OK && !this->ensure_rgb_buffer_(back, out_len))
+    if (err == JPEG_ERR_OK && !this->ensure_buffer_(out, out_capacity, out_len))
       err = JPEG_ERR_NO_MEM;
     if (err == JPEG_ERR_OK) {
-      io.outbuf = this->rgb_[back];
+      io.outbuf = out;
       err = jpeg_dec_process(decoder, &io);
     }
     jpeg_dec_close(decoder);
@@ -643,10 +685,7 @@ bool RtspMjpeg::decode_frame_(const uint8_t *jpeg, size_t len, int src_width, in
       ESP_LOGD(TAG, "Decode failed: %d", err);
       return false;
     }
-    this->back_width_ = plan.out_width;
-    this->back_height_ = plan.out_height;
-    this->back_stride_ = plan.out_width;
-    return true;
+    return this->finish_frame_(plan, back);
   }
   return false;
 }
