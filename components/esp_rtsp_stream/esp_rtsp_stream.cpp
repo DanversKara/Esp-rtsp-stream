@@ -455,14 +455,17 @@ RtspMjpeg::OutputPlan RtspMjpeg::plan_output_(int src_width, int src_height) con
   plan.scaled_width = static_cast<int>(plan.scale * src_width);
   plan.scaled_height = static_cast<int>(plan.scale * src_height);
 #else
-  // esp_new_jpeg shrinks by up to 8x, into dimensions that are multiples of 8.
-  auto decoder_size = [](int src, int target) {
-    const int size = (std::max(target, (src + 7) / 8) + 7) / 8 * 8;
-    return std::min(src, size);
-  };
+  // Only ask esp_new_jpeg for the 1/2, 1/4, 1/8 reductions a JPEG decoder does natively, and only when the
+  // result stays a multiple of 8 and no smaller than the target; finish_frame_() does the rest.
+  int factor = 1;
+  for (int f = 2; f <= 8; f *= 2) {
+    if (src_width % (8 * f) == 0 && src_height % (8 * f) == 0 && src_width / f >= plan.target_width &&
+        src_height / f >= plan.target_height)
+      factor = f;
+  }
   plan.scale = scale;
-  plan.scaled_width = decoder_size(src_width, plan.target_width);
-  plan.scaled_height = decoder_size(src_height, plan.target_height);
+  plan.scaled_width = src_width / factor;
+  plan.scaled_height = src_height / factor;
 #endif
   plan.stage_width = swap ? plan.scaled_height : plan.scaled_width;
   plan.stage_height = swap ? plan.scaled_width : plan.scaled_height;
@@ -471,7 +474,26 @@ RtspMjpeg::OutputPlan RtspMjpeg::plan_output_(int src_width, int src_height) con
   return plan;
 }
 
-/// Bilinear RGB565 (little-endian) resize. Only used for small corrections (ratio at most ~2:1).
+/// Halves an RGB565 image in place by averaging 2x2 blocks (stride == width).
+static void halve_rgb565(uint16_t *buf, int &width, int &height) {
+  const int new_w = width / 2, new_h = height / 2;
+  for (int y = 0; y < new_h; y++) {
+    const uint16_t *row0 = buf + 2 * y * width;
+    const uint16_t *row1 = row0 + width;
+    uint16_t *dst = buf + y * new_w;  // never ahead of the rows still to be read
+    for (int x = 0; x < new_w; x++) {
+      const uint32_t a = row0[2 * x], b = row0[2 * x + 1], c = row1[2 * x], d = row1[2 * x + 1];
+      const uint32_t r = (((a >> 11) & 0x1F) + ((b >> 11) & 0x1F) + ((c >> 11) & 0x1F) + ((d >> 11) & 0x1F) + 2) >> 2;
+      const uint32_t g = (((a >> 5) & 0x3F) + ((b >> 5) & 0x3F) + ((c >> 5) & 0x3F) + ((d >> 5) & 0x3F) + 2) >> 2;
+      const uint32_t bl = ((a & 0x1F) + (b & 0x1F) + (c & 0x1F) + (d & 0x1F) + 2) >> 2;
+      dst[x] = static_cast<uint16_t>((r << 11) | (g << 5) | bl);
+    }
+  }
+  width = new_w;
+  height = new_h;
+}
+
+/// Bilinear RGB565 (little-endian) resize. Used after halving, so the ratio is below 2:1.
 static void resize_rgb565(const uint16_t *src, int src_w, int src_h, int src_stride, uint16_t *dst, int dst_w,
                           int dst_h) {
   const uint32_t x_step = dst_w > 1 ? (static_cast<uint32_t>(src_w - 1) << 16) / (dst_w - 1) : 0;
@@ -541,8 +563,12 @@ bool RtspMjpeg::finish_frame_(const OutputPlan &plan, int back) {
     if (!this->ensure_buffer_(this->rgb_[back], this->rgb_capacity_[back],
                               static_cast<size_t>(plan.out_width) * plan.out_height * 2))
       return false;
-    resize_rgb565(reinterpret_cast<const uint16_t *>(this->scaled_), plan.stage_width, plan.stage_height,
-                  plan.stage_width, reinterpret_cast<uint16_t *>(this->rgb_[back]), plan.out_width, plan.out_height);
+    uint16_t *staged = reinterpret_cast<uint16_t *>(this->scaled_);
+    int width = plan.stage_width, height = plan.stage_height;
+    while (width >= 2 * plan.out_width && height >= 2 * plan.out_height)
+      halve_rgb565(staged, width, height);
+    resize_rgb565(staged, width, height, width, reinterpret_cast<uint16_t *>(this->rgb_[back]), plan.out_width,
+                  plan.out_height);
   }
   this->back_width_ = plan.out_width;
   this->back_height_ = plan.out_height;
@@ -640,7 +666,7 @@ bool RtspMjpeg::decode_frame_(const uint8_t *jpeg, size_t len, int src_width, in
   const int back = this->front_ ^ 1;
   // The RTP header gives the size up front; a pass-through JPEG might differ, so retry once with the real size.
   for (int attempt = 0; attempt < 2; attempt++) {
-    const OutputPlan plan = this->plan_output_(src_width, src_height);
+    OutputPlan plan = this->plan_output_(src_width, src_height);
     jpeg_dec_config_t cfg = DEFAULT_JPEG_DEC_CONFIG();
     cfg.output_type = JPEG_PIXEL_FORMAT_RGB565_LE;
     if (plan.scaled_width != src_width || plan.scaled_height != src_height) {
@@ -667,13 +693,32 @@ bool RtspMjpeg::decode_frame_(const uint8_t *jpeg, size_t len, int src_width, in
       continue;
     }
 
+    int out_len = 0;
+    if (err == JPEG_ERR_OK)
+      err = jpeg_dec_get_outbuf_len(decoder, &out_len);
+    // Trust the decoder's output size, not our request: it may decline a scale and decode at full size.
+    const bool scaling = plan.scaled_width != src_width || plan.scaled_height != src_height;
+    if (err == JPEG_ERR_OK && out_len < plan.scaled_width * plan.scaled_height * 2) {
+      ESP_LOGW(TAG, "Unexpected decoder output size %d for %dx%d", out_len, src_width, src_height);
+      err = JPEG_ERR_FAIL;
+    }
+    if (err == JPEG_ERR_OK && scaling && out_len >= src_width * src_height * 2) {
+      if (!this->scale_fallback_logged_) {
+        this->scale_fallback_logged_ = true;
+        ESP_LOGD(TAG, "Decoder ignored scale %dx%d, scaling %dx%d in software", plan.scaled_width,
+                 plan.scaled_height, src_width, src_height);
+      }
+      const bool swap = this->rotation_ == 90 || this->rotation_ == 270;
+      plan.scaled_width = src_width;
+      plan.scaled_height = src_height;
+      plan.stage_width = swap ? src_height : src_width;
+      plan.stage_height = swap ? src_width : src_height;
+    }
+
     // Decode straight into the frame buffer when the decoder hits the exact size, else into scaled_.
     const bool exact = plan.stage_width == plan.out_width && plan.stage_height == plan.out_height;
     uint8_t *&out = exact ? this->rgb_[back] : this->scaled_;
     size_t &out_capacity = exact ? this->rgb_capacity_[back] : this->scaled_capacity_;
-    int out_len = 0;
-    if (err == JPEG_ERR_OK)
-      err = jpeg_dec_get_outbuf_len(decoder, &out_len);
     if (err == JPEG_ERR_OK && !this->ensure_buffer_(out, out_capacity, out_len))
       err = JPEG_ERR_NO_MEM;
     if (err == JPEG_ERR_OK) {

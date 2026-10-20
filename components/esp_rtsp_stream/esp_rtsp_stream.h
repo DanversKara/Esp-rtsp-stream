@@ -175,6 +175,7 @@ class RtspMjpeg : public Component {
   // Scaler output awaiting the final exact-size resize.
   uint8_t *scaled_{nullptr};
   size_t scaled_capacity_{0};
+  bool scale_fallback_logged_{false};
 
 #ifdef USE_ESP_RTSP_STREAM_HW_JPEG
   jpeg_decoder_handle_t hw_decoder_{nullptr};
