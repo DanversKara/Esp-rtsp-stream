@@ -1,65 +1,174 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
-#include <memory>
 #include <mutex>
 #include <string>
-#include <vector>
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #include "esphome/core/component.h"
-#include "esphome/core/log.h"
+#include "esphome/core/defines.h"
 
-// This header is expected to be provided by the espp/rtsp ESP-IDF component.
-#include "rtsp_client.hpp"
+#ifdef USE_DISPLAY
+#include "esphome/components/display/display.h"
+#endif
+
+#include "rfc2435.h"
+#include "rtsp_client.h"
+
+#ifdef USE_ESP_RTSP_STREAM_HW_JPEG
+#include "driver/jpeg_decode.h"
+#include "driver/ppa.h"
+#endif
 
 namespace esphome {
 namespace esp_rtsp_stream {
 
+/// Pulls an MJPEG stream from an RTSP camera (RTP/JPEG over interleaved TCP) and decodes it to RGB565.
+///
+/// Two FreeRTOS tasks do the work: a network task that runs the RTSP session and rebuilds JPEG frames,
+/// and a decode task. Frames arriving while the decoder is busy, or faster than max_fps, are dropped so
+/// the picture never lags behind the camera. Decoded frames are double-buffered for draw().
 class RtspMjpeg : public Component {
  public:
-  void set_url(const std::string &url) { url_ = url; }
-  void set_fps(int fps) { fps_ = fps; }
-  void set_expected_size(int width, int height) {
-    expected_width_ = width;
-    expected_height_ = height;
+  void set_url(const std::string &url) { this->url_ = url; }
+  void set_credentials(const std::string &username, const std::string &password) {
+    this->username_ = username;
+    this->password_ = password;
   }
-  void set_log_frame_info(bool enabled) { log_frame_info_ = enabled; }
+  void set_max_fps(int fps) { this->max_fps_ = fps; }
+  void set_output_size(int width, int height) {
+    this->box_width_ = width;
+    this->box_height_ = height;
+  }
+  void set_rotation(int degrees) { this->rotation_ = degrees; }
+  void set_max_frame_size(size_t bytes) { this->max_frame_size_ = bytes; }
+  void set_task_cores(int network_core, int decode_core) {
+    this->network_core_ = network_core;
+    this->decode_core_ = decode_core;
+  }
+  void set_log_frame_info(bool enabled) { this->log_frame_info_ = enabled; }
+#ifdef USE_DISPLAY
+  void set_display(display::Display *display) { this->display_ = display; }
+
+  /// Draws the latest frame centred on the display. Call from the display lambda.
+  void draw(display::Display &it);
+  /// Draws the latest frame with its top-left corner at (x, y).
+  void draw(display::Display &it, int x, int y);
+#endif
 
   void setup() override;
   void loop() override;
   void dump_config() override;
   float get_setup_priority() const override { return setup_priority::AFTER_WIFI; }
 
-  // Copy the most recently received complete JPEG frame.
-  bool copy_latest_frame(std::vector<uint8_t> &out, int &width, int &height);
-  uint32_t get_frame_count() const { return frame_count_; }
-  uint32_t get_dropped_frames() const { return dropped_frames_; }
+  bool has_frame() const { return this->front_width_ > 0; }
+  bool is_streaming() const { return this->streaming_; }
+  int get_frame_width() const { return this->front_width_; }
+  int get_frame_height() const { return this->front_height_; }
+  uint32_t get_frame_count() const { return this->decoded_frames_; }
+  uint32_t get_dropped_frames() const { return this->dropped_frames_; }
+  uint32_t get_last_decode_ms() const { return this->last_decode_ms_; }
 
  protected:
-  bool parse_url_();
-  bool start_client_();
-  void stop_client_();
+  struct OutputPlan {
+    float scale;
+    int scaled_width;  // after scaling, before rotation
+    int scaled_height;
+    int out_width;  // after rotation
+    int out_height;
+  };
 
+  static void network_task_(void *arg);
+  static void decode_task_(void *arg);
+  void network_loop_();
+  void decode_loop_();
+
+  /// Runs one RTSP session until it fails. Returns true if at least one frame was received.
+  bool run_session_();
+  bool handle_rtp_(uint16_t len);
+  void frame_complete_(size_t jpeg_len);
+
+  OutputPlan plan_output_(int src_width, int src_height) const;
+  bool decode_frame_(const uint8_t *jpeg, size_t len, int src_width, int src_height);
+  bool ensure_rgb_buffer_(int index, size_t bytes);
+  uint8_t *alloc_jpeg_buffer_(size_t bytes);
+  void free_buffer_(uint8_t *buf);
+
+  // Configuration
   std::string url_;
-  std::string host_;
-  std::string path_;
-  int port_{554};
-  int fps_{10};
-  int expected_width_{704};
-  int expected_height_{576};
+  std::string username_;
+  std::string password_;
+  int max_fps_{10};
+  int box_width_{0};
+  int box_height_{0};
+  int rotation_{0};
+  size_t max_frame_size_{256 * 1024};
+  int network_core_{0};
+  int decode_core_{1};
   bool log_frame_info_{true};
+#ifdef USE_DISPLAY
+  display::Display *display_{nullptr};
+#endif
 
-  std::unique_ptr<espp::RtspClient> client_;
-  mutable std::mutex frame_mutex_;
-  std::vector<uint8_t> latest_frame_;
-  int latest_width_{0};
-  int latest_height_{0};
-  uint32_t last_frame_ms_{0};
-  uint32_t last_report_ms_{0};
-  uint32_t frame_count_{0};
-  uint32_t dropped_frames_{0};
-  bool connected_{false};
-  bool reconnect_pending_{false};
+  RtspUrl parsed_url_;
+  RtspConnection conn_;
+  MjpegAssembler assembler_;
+  TaskHandle_t network_task_handle_{nullptr};
+  TaskHandle_t decode_task_handle_{nullptr};
+
+  // Network task state
+  int video_payload_type_{26};
+  uint8_t rtp_channel_{0};
+  bool have_seq_{false};
+  uint16_t last_seq_{0};
+  uint8_t qtables_[256];
+  uint32_t next_frame_due_ms_{0};
+  uint32_t session_frames_{0};
+
+  // JPEG hand-off: the network task fills jpeg_buffers_[fill_index_]; the decoder reads the other one.
+  uint8_t *jpeg_buffers_[2]{nullptr, nullptr};
+  int fill_index_{0};
+  int ready_index_{0};
+  size_t ready_len_{0};
+  int ready_width_{0};
+  int ready_height_{0};
+  std::atomic<bool> decoder_busy_{false};
+
+  // RGB565 double buffer: the decoder writes rgb_[front_ ^ 1], draw() reads rgb_[front_].
+  std::mutex frame_mutex_;
+  uint8_t *rgb_[2]{nullptr, nullptr};
+  size_t rgb_capacity_[2]{0, 0};
+  int back_width_{0};
+  int back_height_{0};
+  int back_stride_{0};
+  int front_{0};
+  int front_width_{0};
+  int front_height_{0};
+  int front_stride_{0};
+  std::atomic<bool> new_frame_{false};
+
+#ifdef USE_ESP_RTSP_STREAM_HW_JPEG
+  jpeg_decoder_handle_t hw_decoder_{nullptr};
+  ppa_client_handle_t ppa_client_{nullptr};
+  uint8_t *staging_{nullptr};
+  size_t staging_capacity_{0};
+#endif
+
+  // Statistics
+  std::atomic<bool> streaming_{false};
+  std::atomic<uint32_t> received_frames_{0};
+  std::atomic<uint32_t> decoded_frames_{0};
+  std::atomic<uint32_t> dropped_frames_{0};
+  std::atomic<uint32_t> corrupt_frames_{0};
+  std::atomic<uint32_t> last_decode_ms_{0};
+  int stream_width_{0};
+  int stream_height_{0};
+  uint32_t last_stats_ms_{0};
+  uint32_t last_stats_decoded_{0};
+  uint32_t last_warning_ms_{0};
 };
 
 }  // namespace esp_rtsp_stream
