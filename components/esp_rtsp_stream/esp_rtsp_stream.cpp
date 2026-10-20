@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <strings.h>
 
 #include <esp_heap_caps.h>
@@ -61,12 +62,26 @@ void RtspMjpeg::setup() {
 }
 
 void RtspMjpeg::loop() {
-  if (this->new_frame_.exchange(false)) {
+  const bool new_frame = this->new_frame_.exchange(false);
 #ifdef USE_DISPLAY
-    if (this->display_ != nullptr)
-      this->display_->update();
+  if (new_frame && this->display_ != nullptr)
+    this->display_->update();
 #endif
+#ifdef USE_LVGL
+  // Runs in the main loop, so touching LVGL objects here is safe.
+  if (this->lvgl_canvas_ != nullptr) {
+    lv_obj_t *canvas = *this->lvgl_canvas_;
+    const bool visible = canvas != nullptr && lv_obj_is_visible(canvas);
+    if (visible && this->box_width_ == 0) {
+      // No output size configured: fit the frame to the canvas.
+      this->box_width_ = lv_obj_get_width(canvas);
+      this->box_height_ = lv_obj_get_height(canvas);
+    }
+    this->frames_wanted_ = visible;
+    if (visible && new_frame)
+      this->update_lvgl_canvas_(canvas);
   }
+#endif
 
   const uint32_t now = millis();
   if (this->log_frame_info_ && now - this->last_stats_ms_ >= 30000) {
@@ -348,6 +363,8 @@ void RtspMjpeg::frame_complete_(size_t jpeg_len) {
   this->session_frames_++;
   this->stream_width_ = this->assembler_.width();
   this->stream_height_ = this->assembler_.height();
+  if (!this->frames_wanted_)
+    return;
 
   // Drop rather than queue: a backlog would show an ever older picture.
   const uint32_t now = millis();
@@ -660,6 +677,40 @@ void RtspMjpeg::draw(display::Display &it, int x, int y) {
   it.draw_pixels_at(x, y, this->front_width_, this->front_height_, this->rgb_[this->front_], display::COLOR_ORDER_RGB,
                     display::COLOR_BITNESS_565, false, 0, 0, this->front_stride_ - this->front_width_);
 #pragma GCC diagnostic pop
+}
+#endif
+
+#ifdef USE_LVGL
+void RtspMjpeg::update_lvgl_canvas_(lv_obj_t *canvas) {
+  lv_draw_buf_t *buf = lv_canvas_get_draw_buf(canvas);
+  if (buf == nullptr || buf->data == nullptr || buf->header.cf != LV_COLOR_FORMAT_RGB565) {
+    ESP_LOGW(TAG, "LVGL canvas must be an RGB565 canvas (color_depth 16, transparent: false)");
+    this->lvgl_canvas_ = nullptr;
+    return;
+  }
+  const int dst_w = buf->header.w;
+  const int dst_h = buf->header.h;
+  const int dst_stride = buf->header.stride;
+
+  std::lock_guard<std::mutex> lock(this->frame_mutex_);
+  if (this->front_width_ == 0)
+    return;
+  if (this->front_width_ != this->canvas_frame_width_ || this->front_height_ != this->canvas_frame_height_) {
+    memset(buf->data, 0, static_cast<size_t>(dst_stride) * dst_h);  // black borders around a smaller frame
+    this->canvas_frame_width_ = this->front_width_;
+    this->canvas_frame_height_ = this->front_height_;
+  }
+  // Centre the frame; crop it if it is larger than the canvas.
+  const int w = std::min(this->front_width_, dst_w);
+  const int h = std::min(this->front_height_, dst_h);
+  const int dst_x = (dst_w - w) / 2, dst_y = (dst_h - h) / 2;
+  const int src_x = (this->front_width_ - w) / 2, src_y = (this->front_height_ - h) / 2;
+  const uint8_t *src = this->rgb_[this->front_];
+  for (int row = 0; row < h; row++) {
+    memcpy(buf->data + (dst_y + row) * dst_stride + dst_x * 2,
+           src + ((src_y + row) * this->front_stride_ + src_x) * 2, w * 2);
+  }
+  lv_obj_invalidate(canvas);
 }
 #endif
 

@@ -109,4 +109,26 @@ The display section is the same as for the S3, typically with a `mipi_dsi` panel
 - MJPEG only; no H.264/H.265.
 - RTP over TCP only. A camera that refuses TCP transport fails at SETUP.
 - 8-bit quantisation tables only; 16-bit tables are rare.
-- No LVGL widget. Draw from a display lambda.
+- With LVGL, use `lvgl_canvas` (below), not a display lambda: LVGL owns the screen.
+
+## LVGL
+
+```yaml
+esp_rtsp_stream:
+  - id: front_door
+    url: rtsp://192.168.1.64:554/Streaming/Channels/102
+    lvgl_canvas: cam_canvas   # output size defaults to the canvas size
+
+lvgl:
+  pages:
+    - id: cam_page
+      widgets:
+        - canvas:
+            id: cam_canvas
+            x: 0
+            y: 0
+            width: 320
+            height: 240
+```
+
+The frame is copied into the canvas from the main loop, which is safe for LVGL, and centred on it. While the canvas isn't on screen (another page is showing), frames are not decoded. The RTSP session stays connected, so the picture comes back instantly.

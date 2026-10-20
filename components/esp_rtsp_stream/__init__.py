@@ -12,6 +12,11 @@ from esphome.const import (
 )
 import esphome.final_validate as fv
 
+try:
+    from esphome.components.lvgl.widgets.canvas import lv_canvas_t
+except ImportError:  # ESPHome without LVGL 9 canvas support
+    lv_canvas_t = None
+
 DEPENDENCIES = ["esp32", "network"]
 MULTI_CONF = True
 
@@ -23,6 +28,13 @@ CONF_OUTPUT_WIDTH = "output_width"
 CONF_OUTPUT_HEIGHT = "output_height"
 CONF_MAX_FRAME_SIZE = "max_frame_size"
 CONF_LOG_FRAME_INFO = "log_frame_info"
+CONF_LVGL_CANVAS = "lvgl_canvas"
+
+
+def _lvgl_canvas_id(value):
+    if lv_canvas_t is None:
+        raise cv.Invalid("lvgl_canvas needs an ESPHome version with LVGL 9 canvas support")
+    return cv.use_id(lv_canvas_t)(value)
 
 # Per-chip tuning, picked from the `esp32:` variant/board.
 #  - ESP32-S3: software decode (esp_new_jpeg, SIMD). ~20 fps at 640x480, ~15 fps at 800x480,
@@ -92,6 +104,7 @@ CONFIG_SCHEMA = cv.All(
                 min=16 * 1024, max=4 * 1024 * 1024
             ),
             cv.Optional(CONF_DISPLAY_ID): cv.use_id(display.Display),
+            cv.Optional(CONF_LVGL_CANVAS): _lvgl_canvas_id,
             cv.Optional(CONF_LOG_FRAME_INFO, default=True): cv.boolean,
         }
     ).extend(cv.COMPONENT_SCHEMA),
@@ -144,6 +157,10 @@ async def to_code(config):
     if CONF_DISPLAY_ID in config:
         disp = await cg.get_variable(config[CONF_DISPLAY_ID])
         cg.add(var.set_display(disp))
+    if CONF_LVGL_CANVAS in config:
+        # LVGL creates the widget during its own setup, so pass the pointer's address, not its value.
+        canvas = await cg.get_variable(config[CONF_LVGL_CANVAS])
+        cg.add(var.set_lvgl_canvas(cg.RawExpression(f"&{canvas}")))
 
     if profile["idf_component"] is not None:
         name, ref = profile["idf_component"]

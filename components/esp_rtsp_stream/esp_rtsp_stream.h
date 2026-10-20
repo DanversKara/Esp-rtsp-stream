@@ -14,6 +14,9 @@
 #ifdef USE_DISPLAY
 #include "esphome/components/display/display.h"
 #endif
+#ifdef USE_LVGL
+#include <lvgl.h>
+#endif
 
 #include "rfc2435.h"
 #include "rtsp_client.h"
@@ -58,6 +61,10 @@ class RtspMjpeg : public Component {
   /// Draws the latest frame with its top-left corner at (x, y).
   void draw(display::Display &it, int x, int y);
 #endif
+#ifdef USE_LVGL
+  /// Shows frames in an LVGL canvas. Takes the address of the widget pointer, which LVGL assigns later.
+  void set_lvgl_canvas(lv_obj_t **canvas) { this->lvgl_canvas_ = canvas; }
+#endif
 
   void setup() override;
   void loop() override;
@@ -94,6 +101,9 @@ class RtspMjpeg : public Component {
   OutputPlan plan_output_(int src_width, int src_height) const;
   bool decode_frame_(const uint8_t *jpeg, size_t len, int src_width, int src_height);
   bool ensure_rgb_buffer_(int index, size_t bytes);
+#ifdef USE_LVGL
+  void update_lvgl_canvas_(lv_obj_t *canvas);
+#endif
   uint8_t *alloc_jpeg_buffer_(size_t bytes);
   void free_buffer_(uint8_t *buf);
 
@@ -112,6 +122,13 @@ class RtspMjpeg : public Component {
 #ifdef USE_DISPLAY
   display::Display *display_{nullptr};
 #endif
+#ifdef USE_LVGL
+  lv_obj_t **lvgl_canvas_{nullptr};
+  int canvas_frame_width_{0};
+  int canvas_frame_height_{0};
+#endif
+  // False while nothing shows the stream (e.g. the canvas page is hidden): frames are not decoded.
+  std::atomic<bool> frames_wanted_{true};
 
   RtspUrl parsed_url_;
   RtspConnection conn_;
