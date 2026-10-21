@@ -1,0 +1,1418 @@
+# =============================================================================
+# CCTV Box - standalone 4-camera viewer + SD-card recorder for the
+# ESP32-S3-BOX-3 (recording needs the BOX-3-SENSOR base with its microSD slot)
+# -----------------------------------------------------------------------------
+#  Home     clock, status bar and a floating camera window you can drag/resize
+#  CCTV     one camera full width: 1-4 pick camera, REC records it,
+#           FLOAT pins it to the home screen, GRID shows all four
+#  Grid     all four cameras 2x2; tap one to open it, X to go back
+#  HA       per-camera Record switches, float on/off + camera select,
+#           SD card free space / file count, Record all / Stop all buttons
+# Recordings: /cctv/<YYYYMMDD_HHMMSS>_<name>.avi on the card (Motion-JPEG AVI,
+# plays in VLC). Files are split every few minutes and the oldest are deleted
+# automatically when the card gets full.
+# Files needed next to this YAML: components/esp_rtsp_stream, components/cctv_sdcard
+# =============================================================================
+
+substitutions:
+  name: cctv-box
+  friendly_name: CCTV Box
+  # Camera streams - MJPEG over HTTP (motionEye/motion streaming port) or RTSP.
+  cam1_url: "http://192.168.8.212:9081"
+  cam2_url: "http://192.168.8.212:9084"
+  cam3_url: "http://192.168.8.212:9085"
+  cam4_url: "http://192.168.8.212:9081"   # same camera as cam1 for now
+  # Names show on screen, in HA and in recording file names (keep them unique).
+  cam1_name: "DOOR"
+  cam2_name: "WINDOW"
+  cam3_name: "PARKING LOT"
+  cam4_name: "DOOR 2"
+  # On-screen decode rate per camera (single view / floating, and 2x2 grid).
+  cctv_single_fps: "4"
+  cctv_grid_fps: "2"
+  # Recording: frames per second written to the card, and length of each file.
+  # 1080p frames are ~100 KB, so 2 fps is ~200 KB/s (~0.7 GB/hour) per camera.
+  cctv_record_fps: "2"
+  cctv_record_segment: "5min"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  name_add_mac_suffix: false
+  on_boot:
+    # Resume recordings that were on before a reboot, once the clock is set
+    # (file names use the date/time).
+    - priority: -100
+      then:
+        - wait_until:
+            condition:
+              lambda: 'return id(sntp_time).now().is_valid();'
+            timeout: 90s
+        - lambda: |-
+            esp_rtsp_stream::RtspMjpeg *cams[4] = {id(cam1), id(cam2), id(cam3), id(cam4)};
+            for (int i = 0; i < 4; i++)
+              if (id(rec_mask) & (1 << i)) cams[i]->start_recording();
+        - script.execute: cctv_rec_refresh
+
+esp32:
+  board: esp32s3box
+  flash_size: 16MB
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
+      # Keep 64 KB of internal (DMA-capable) RAM for the display SPI and the
+      # SD card, so camera streams can't starve them.
+      CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL: "65536"
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [ esp_rtsp_stream, cctv_sdcard ]
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: NONE
+  # Network buffers in PSRAM: several camera streams would otherwise use up
+  # internal RAM ("spi_master: Failed to allocate priv TX buffer").
+  use_psram: true
+  ap:
+    ssid: ${name}
+
+captive_portal:
+
+time:
+  - platform: sntp
+    id: sntp_time
+
+# =============================================================================
+# Cameras and SD card
+# =============================================================================
+# Each stream is moved at runtime to whichever canvas is on screen (CCTV page,
+# floating home window or a grid cell) by the cctv_route script. A camera that
+# is neither on screen nor recording disconnects after idle_timeout.
+esp_rtsp_stream:
+  - id: cam1
+    url: ${cam1_url}
+    lvgl_canvas: cctv_page_canvas
+    max_fps: ${cctv_single_fps}
+    max_frame_size: 262144        # 256 KB per JPEG (1080p frames can exceed 128 KB)
+    idle_timeout: 10s             # disconnect when off screen (unless recording)
+    record_dir: /sdcard/cctv
+    record_label: "${cam1_name}"
+    record_fps: ${cctv_record_fps}
+    record_segment: ${cctv_record_segment}
+    log_frame_info: true
+  - id: cam2
+    url: ${cam2_url}
+    lvgl_canvas: cctv_grid_canvas_2
+    max_fps: ${cctv_single_fps}
+    max_frame_size: 262144        # 256 KB per JPEG (1080p frames can exceed 128 KB)
+    idle_timeout: 10s             # disconnect when off screen (unless recording)
+    record_dir: /sdcard/cctv
+    record_label: "${cam2_name}"
+    record_fps: ${cctv_record_fps}
+    record_segment: ${cctv_record_segment}
+    log_frame_info: true
+  - id: cam3
+    url: ${cam3_url}
+    lvgl_canvas: cctv_grid_canvas_3
+    max_fps: ${cctv_single_fps}
+    max_frame_size: 262144        # 256 KB per JPEG (1080p frames can exceed 128 KB)
+    idle_timeout: 10s             # disconnect when off screen (unless recording)
+    record_dir: /sdcard/cctv
+    record_label: "${cam3_name}"
+    record_fps: ${cctv_record_fps}
+    record_segment: ${cctv_record_segment}
+    log_frame_info: true
+  - id: cam4
+    url: ${cam4_url}
+    lvgl_canvas: cctv_grid_canvas_4
+    max_fps: ${cctv_single_fps}
+    max_frame_size: 262144        # 256 KB per JPEG (1080p frames can exceed 128 KB)
+    idle_timeout: 10s             # disconnect when off screen (unless recording)
+    record_dir: /sdcard/cctv
+    record_label: "${cam4_name}"
+    record_fps: ${cctv_record_fps}
+    record_segment: ${cctv_record_segment}
+    log_frame_info: true
+
+# microSD on the BOX-3-SENSOR base (4-bit SDMMC; pins are the defaults).
+# Card must be FAT32 (cards over 32 GB usually come as exFAT - reformat them).
+cctv_sdcard:
+  id: sd_card
+  recordings_dir: /sdcard/cctv
+  min_free: 1GB          # delete the oldest recordings below this
+  keep_newest: 8         # ...but never the newest 8 files
+
+# =============================================================================
+# Hardware: backlight, display, touch
+# =============================================================================
+output:
+  - platform: ledc
+    pin: GPIO47
+    id: backlight_output
+
+light:
+  - platform: monochromatic
+    id: backlight
+    name: "LCD Backlight"
+    output: backlight_output
+    restore_mode: ALWAYS_ON
+
+spi:
+  - id: spi_bus
+    clk_pin: 7
+    mosi_pin: 6
+
+i2c:
+  - id: bus_a
+    sda: GPIO08
+    scl: GPIO18
+    frequency: 100kHz
+
+display:
+  - platform: mipi_spi
+    id: s3_box_lcd
+    model: S3BOX
+    data_rate: 40MHz
+    cs_pin: 5
+    dc_pin: 4
+    reset_pin:
+      number: 48
+      inverted: true
+    color_order: bgr
+    invert_colors: false
+
+touchscreen:
+  - platform: gt911
+    id: box_touch
+    i2c_id: bus_a
+    display: s3_box_lcd
+
+binary_sensor:
+  # The red circle under the screen: back to the home page.
+  - platform: gt911
+    name: "Home Button"
+    index: 0
+    on_press:
+      - globals.set:
+          id: current_page
+          value: '"home"'
+      - lvgl.page.show: home_page
+  - platform: template
+    name: "SD Card Mounted"
+    icon: mdi:sd
+    entity_category: diagnostic
+    lambda: 'return id(sd_card).is_mounted();'
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_medium
+    size: 22
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 16
+  - file: "gfonts://Roboto"
+    id: font_clock
+    size: 48
+    glyphs: "0123456789:APM "
+
+# =============================================================================
+# State
+# =============================================================================
+globals:
+  - id: current_page
+    type: std::string
+    restore_value: false
+    initial_value: '"home"'
+  # Camera on the CCTV page / in the floating window (0-3 = cam1-cam4).
+  - id: cctv_view_cam
+    type: int
+    restore_value: true
+    initial_value: '0'
+  - id: cctv_float_cam
+    type: int
+    restore_value: true
+    initial_value: '0'
+  # Floating window: on/off, position and size survive reboots.
+  - id: cctv_float_on
+    type: bool
+    restore_value: true
+    initial_value: 'true'
+  - id: cctv_x
+    type: int
+    restore_value: true
+    initial_value: '168'
+  - id: cctv_y
+    type: int
+    restore_value: true
+    initial_value: '46'
+  - id: cctv_w
+    type: int
+    restore_value: true
+    initial_value: '144'
+  - id: cctv_h
+    type: int
+    restore_value: true
+    initial_value: '108'
+  - id: cctv_drag_dist
+    type: int
+    restore_value: false
+    initial_value: '0'
+  # Which cameras are recording (bit 0 = cam1), restored after a reboot.
+  - id: rec_mask
+    type: int
+    restore_value: true
+    initial_value: '0'
+  - id: rec_blink
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+script:
+  #── Give each camera the canvas that's about to be on screen.
+  # view: 0 = none, 1 = CCTV page (selected camera), 2 = home floating
+  # window (float camera), 3 = 2x2 grid (all four). Cameras with no canvas
+  # are "parked" and disconnect after idle_timeout (unless recording).
+  - id: cctv_route
+    parameters:
+      view: int
+    then:
+      - lambda: |-
+          using esp_rtsp_stream::RtspMjpeg;
+          RtspMjpeg *cams[4] = {id(cam1), id(cam2), id(cam3), id(cam4)};
+          static lv_obj_t *parked = nullptr;
+          for (RtspMjpeg *c : cams) c->set_lvgl_canvas(&parked);
+          auto attach = [](RtspMjpeg *c, lv_obj_t **canvas, int w, int h, int fps) {
+            lv_canvas_fill_bg(*canvas, lv_color_hex(0x000000), LV_OPA_COVER);
+            c->set_output_size(w, h);
+            c->set_max_fps(fps);
+            c->set_lvgl_canvas(canvas);
+          };
+          if (view == 1) {
+            attach(cams[id(cctv_view_cam) & 3], &id(cctv_page_canvas), 320, 200, ${cctv_single_fps});
+          } else if (view == 2) {
+            attach(cams[id(cctv_float_cam) & 3], &id(cctv_float_canvas), id(cctv_w), id(cctv_h), ${cctv_single_fps});
+          } else if (view == 3) {
+            lv_obj_t **grid[4] = {&id(cctv_grid_canvas_1), &id(cctv_grid_canvas_2),
+                                  &id(cctv_grid_canvas_3), &id(cctv_grid_canvas_4)};
+            for (int i = 0; i < 4; i++) attach(cams[i], grid[i], 160, 120, ${cctv_grid_fps});
+          }
+
+  #── CCTV page: camera name, highlighted 1-4 button, FLOAT and REC buttons ──
+  - id: cctv_page_refresh
+    then:
+      - lambda: |-
+          const char *names[4] = {"${cam1_name}", "${cam2_name}", "${cam3_name}", "${cam4_name}"};
+          esp_rtsp_stream::RtspMjpeg *cams[4] = {id(cam1), id(cam2), id(cam3), id(cam4)};
+          const int v = id(cctv_view_cam) & 3;
+          lv_label_set_text(id(cctv_page_name), names[v]);
+          lv_obj_t *chips[4] = {id(cctv_sel_1), id(cctv_sel_2), id(cctv_sel_3), id(cctv_sel_4)};
+          for (int i = 0; i < 4; i++)
+            lv_obj_set_style_bg_color(chips[i], lv_color_hex(i == v ? 0x16A085 : 0x1F2632), 0);
+          const bool floating = id(cctv_float_on) && (id(cctv_float_cam) & 3) == v;
+          lv_label_set_text(id(cctv_float_btn_label), floating ? "FLOATING" : "FLOAT");
+          lv_obj_set_style_bg_color(id(cctv_float_btn), lv_color_hex(floating ? 0xFFC107 : 0x1F2632), 0);
+          lv_obj_set_style_text_color(id(cctv_float_btn_label), lv_color_hex(floating ? 0x241700 : 0xFFFFFF), 0);
+          const bool rec = cams[v]->is_recording();
+          lv_label_set_text(id(cctv_rec_btn_label), rec ? "STOP REC" : "REC");
+          lv_obj_set_style_bg_color(id(cctv_rec_btn), lv_color_hex(rec ? 0xE74C3C : 0x1F2632), 0);
+
+  #── Floating window: saved position/size/visibility + indicators ──
+  - id: cctv_float_apply
+    then:
+      - lambda: |-
+          lv_obj_t *w = id(cctv_float);
+          lv_obj_t *scr = lv_obj_get_parent(w);
+          const int sw = lv_obj_get_width(scr), sh = lv_obj_get_height(scr);
+          int cw = std::max(96, std::min(id(cctv_w), sw));
+          int ch = std::max(54, std::min(id(cctv_h), sh));
+          int cx = std::max(0, std::min(id(cctv_x), sw - cw));
+          int cy = std::max(0, std::min(id(cctv_y), sh - ch));
+          id(cctv_w) = cw; id(cctv_h) = ch; id(cctv_x) = cx; id(cctv_y) = cy;
+          id(cctv_view_cam) &= 3;
+          id(cctv_float_cam) &= 3;
+          lv_obj_set_size(w, cw, ch);
+          lv_obj_set_pos(w, cx, cy);
+          if (id(cctv_float_on)) lv_obj_clear_flag(w, LV_OBJ_FLAG_HIDDEN);
+          else lv_obj_add_flag(w, LV_OBJ_FLAG_HIDDEN);
+          lv_obj_set_style_text_color(id(cctv_home_toggle_label),
+              lv_color_hex(id(cctv_float_on) ? 0xFFC107 : 0x5A6472), 0);
+          const char *names[4] = {"${cam1_name}", "${cam2_name}", "${cam3_name}", "${cam4_name}"};
+          lv_label_set_text(id(cctv_float_name), names[id(cctv_float_cam)]);
+      - script.execute: cctv_page_refresh
+
+  #── Start/stop recording one camera (remembered across reboots) ──
+  - id: cctv_rec_set
+    mode: queued
+    parameters:
+      cam: int
+      enable: bool   # not "on": YAML reads a bare on as true
+    then:
+      - lambda: |-
+          esp_rtsp_stream::RtspMjpeg *cams[4] = {id(cam1), id(cam2), id(cam3), id(cam4)};
+          const int i = cam & 3;
+          if (enable) {
+            cams[i]->start_recording();
+            id(rec_mask) |= (1 << i);
+          } else {
+            cams[i]->stop_recording();
+            id(rec_mask) &= ~(1 << i);
+          }
+      - script.execute: cctv_rec_refresh
+
+  #── REC badges / buttons. Red "REC" = writing to the card; orange "REC..."
+  # = switched on but waiting (no SD card yet, or camera reconnecting).
+  - id: cctv_rec_refresh
+    then:
+      - lambda: |-
+          esp_rtsp_stream::RtspMjpeg *cams[4] = {id(cam1), id(cam2), id(cam3), id(cam4)};
+          auto badge = [](lv_obj_t *l, esp_rtsp_stream::RtspMjpeg *c, bool blink) {
+            if (!c->is_recording()) {
+              lv_obj_add_flag(l, LV_OBJ_FLAG_HIDDEN);
+              return;
+            }
+            const bool writing = c->is_writing();
+            lv_label_set_text(l, writing ? "REC" : "REC...");
+            lv_obj_set_style_bg_color(l, lv_color_hex(writing ? 0xE74C3C : 0xE67E22), 0);
+            lv_obj_set_style_bg_opa(l, (writing && blink) ? LV_OPA_40 : LV_OPA_COVER, 0);
+            lv_obj_clear_flag(l, LV_OBJ_FLAG_HIDDEN);
+          };
+          const bool blink = id(rec_blink);
+          lv_obj_t *grid[4] = {id(cctv_grid_rec_1), id(cctv_grid_rec_2), id(cctv_grid_rec_3), id(cctv_grid_rec_4)};
+          lv_obj_t *chips[4] = {id(cctv_sel_1_label), id(cctv_sel_2_label), id(cctv_sel_3_label), id(cctv_sel_4_label)};
+          int recording = 0;
+          for (int i = 0; i < 4; i++) {
+            badge(grid[i], cams[i], blink);
+            lv_obj_set_style_text_color(chips[i], lv_color_hex(cams[i]->is_recording() ? 0xFF6B5B : 0xFFFFFF), 0);
+            if (cams[i]->is_recording()) recording++;
+          }
+          badge(id(cctv_page_rec), cams[id(cctv_view_cam) & 3], blink);
+          badge(id(cctv_float_rec), cams[id(cctv_float_cam) & 3], blink);
+          // Home top bar: how many cameras are recording.
+          if (recording > 0) {
+            char buf[16];
+            snprintf(buf, sizeof(buf), "REC %d", recording);
+            lv_label_set_text(id(home_rec_label), buf);
+            lv_obj_clear_flag(id(home_rec_label), LV_OBJ_FLAG_HIDDEN);
+          } else {
+            lv_obj_add_flag(id(home_rec_label), LV_OBJ_FLAG_HIDDEN);
+          }
+      - script.execute: cctv_page_refresh
+
+interval:
+  # Clock, connection/SD status and "Connecting..." overlays.
+  - interval: 1s
+    then:
+      - lambda: |-
+          auto t = id(sntp_time).now();
+          if (t.is_valid()) {
+            std::string ts = t.strftime("%I:%M:%S %p");
+            if (!ts.empty() && ts[0] == '0') ts.erase(0, 1);
+            lv_label_set_text(id(clock_label), ts.c_str());
+            lv_label_set_text(id(date_label), t.strftime("%A, %B %d").c_str());
+          }
+          const bool wifi_ok = wifi::global_wifi_component->is_connected();
+          const bool api_ok = api::global_api_server->is_connected();
+          lv_obj_set_style_text_color(id(wifi_icon), lv_color_hex(wifi_ok ? 0x2ECC71 : 0xE74C3C), 0);
+          lv_obj_set_style_text_color(id(ha_icon), lv_color_hex(api_ok ? 0x2ECC71 : 0xE74C3C), 0);
+          char sd[24];
+          if (id(sd_card).is_mounted()) snprintf(sd, sizeof(sd), "SD %.1f GB", id(sd_card).get_free_gb());
+          else snprintf(sd, sizeof(sd), "NO SD");
+          lv_label_set_text(id(sd_label), sd);
+          lv_obj_set_style_text_color(id(sd_label), lv_color_hex(id(sd_card).is_mounted() ? 0xB7C0CC : 0xE67E22), 0);
+
+          using esp_rtsp_stream::RtspMjpeg;
+          RtspMjpeg *cams[4] = {id(cam1), id(cam2), id(cam3), id(cam4)};
+          auto show = [](lv_obj_t *l, RtspMjpeg *c) {
+            const bool streaming = c->is_streaming();
+            if (streaming && c->has_frame()) {
+              lv_obj_add_flag(l, LV_OBJ_FLAG_HIDDEN);
+            } else {
+              lv_label_set_text(l, streaming ? "Waiting for video..." : "Connecting...");
+              lv_obj_clear_flag(l, LV_OBJ_FLAG_HIDDEN);
+            }
+          };
+          show(id(cctv_page_status), cams[id(cctv_view_cam) & 3]);
+          show(id(cctv_float_status), cams[id(cctv_float_cam) & 3]);
+          lv_obj_t *grid[4] = {id(cctv_grid_status_1), id(cctv_grid_status_2),
+                               id(cctv_grid_status_3), id(cctv_grid_status_4)};
+          for (int i = 0; i < 4; i++) show(grid[i], cams[i]);
+          id(rec_blink) = !id(rec_blink);
+      - script.execute: cctv_rec_refresh
+
+# =============================================================================
+# Screens
+# =============================================================================
+lvgl:
+  id: lv
+  displays:
+    - s3_box_lcd
+  touchscreens:
+    - box_touch
+  pages:
+    # ------------------------------------------------------------------
+    # HOME - clock + floating camera window
+    # ------------------------------------------------------------------
+    - id: home_page
+      bg_color: 0x000000
+      on_load:
+        - script.execute: cctv_float_apply
+        - script.execute:
+            id: cctv_route
+            view: 2
+      widgets:
+        - obj:
+            id: top_bar
+            x: 0
+            y: 0
+            width: 100%
+            height: 40
+            radius: 0
+            bg_color: 0x16A085
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            widgets:
+              - button:
+                  id: home_cctv_btn
+                  x: 6
+                  y: 4
+                  width: 80
+                  height: 32
+                  radius: 8
+                  bg_color: 0x0E6655
+                  shadow_width: 0
+                  widgets:
+                    - label:
+                        text: "CCTV"
+                        align: CENTER
+                        text_font: font_small
+                        text_color: 0xFFFFFF
+                  on_click:
+                    - globals.set:
+                        id: current_page
+                        value: '"cctv"'
+                    - lvgl.page.show: cctv_page
+              - label:
+                  id: home_rec_label
+                  text: "REC"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+                  bg_color: 0xE74C3C
+                  bg_opa: COVER
+                  pad_all: 4
+                  radius: 6
+                  hidden: true
+              - button:
+                  id: home_grid_btn
+                  align: TOP_RIGHT
+                  x: -6
+                  y: 4
+                  width: 80
+                  height: 32
+                  radius: 8
+                  bg_color: 0x0E6655
+                  shadow_width: 0
+                  widgets:
+                    - label:
+                        text: "GRID"
+                        align: CENTER
+                        text_font: font_small
+                        text_color: 0xFFFFFF
+                  on_click:
+                    - globals.set:
+                        id: current_page
+                        value: '"cctv_grid"'
+                    - lvgl.page.show: cctv_grid_page
+        - label:
+            id: clock_label
+            text: "--:--"
+            text_font: font_clock
+            text_color: 0xFFFFFF
+            align: CENTER
+            y: -20
+        - label:
+            id: date_label
+            text: ""
+            text_font: font_medium
+            text_color: 0xFFFFFF
+            align: CENTER
+            y: 20
+        # Bottom status bar: Wi-Fi, Home Assistant, SD card, float toggle.
+        - label:
+            id: wifi_icon
+            text: "\uF1EB"
+            align: BOTTOM_LEFT
+            x: 8
+            y: -6
+            text_font: montserrat_18
+            text_color: 0xE74C3C
+        - label:
+            id: ha_icon
+            text: "\uF015"
+            align: BOTTOM_LEFT
+            x: 38
+            y: -6
+            text_font: montserrat_18
+            text_color: 0xE74C3C
+        - label:
+            id: sd_label
+            text: "NO SD"
+            align: BOTTOM_LEFT
+            x: 70
+            y: -6
+            text_font: font_small
+            text_color: 0xE67E22
+        - button:
+            id: cctv_home_toggle
+            align: BOTTOM_RIGHT
+            x: -6
+            y: -2
+            width: 44
+            height: 28
+            radius: 6
+            bg_opa: TRANSP
+            shadow_width: 0
+            border_width: 0
+            widgets:
+              - label:
+                  id: cctv_home_toggle_label
+                  text: "\uF008"
+                  align: CENTER
+                  text_font: montserrat_18
+                  text_color: 0xFFC107
+            on_click:
+              - lambda: 'id(cctv_float_on) = !id(cctv_float_on);'
+              - script.execute: cctv_float_apply
+
+        # ------------------------------------------------------------------
+        # FLOATING CCTV WINDOW - picture-in-picture over the home screen.
+        #   * drag the picture to move it
+        #   * drag the amber corner grip to resize (keeps the camera's aspect)
+        #   * tap the picture to open the full CCTV page
+        #   * X hides it (camera icon at the bottom, the CCTV page, or the
+        #     "CCTV Floating Window" switch in HA brings it back).
+        #   Position, size and on/off are saved across reboots.
+        # The canvas is a fixed 320x240 buffer centred in the window; the
+        # window clips it and the stream is scaled to the window size, so
+        # resizing never needs a new canvas buffer.
+        # Declared last on the home page so it floats on top of everything.
+        # ------------------------------------------------------------------
+        - obj:
+            id: cctv_float
+            align: TOP_LEFT
+            x: 168
+            y: 46
+            width: 144
+            height: 108
+            radius: 0
+            bg_color: 0x000000
+            bg_opa: COVER
+            border_width: 2
+            border_color: 0xFFC107
+            border_post: true
+            pad_all: 0
+            shadow_width: 12
+            shadow_color: 0x000000
+            shadow_opa: 70%
+            scrollable: false
+            scrollbar_mode: "OFF"
+            hidden: true
+            widgets:
+              - canvas:
+                  id: cctv_float_canvas
+                  align: CENTER
+                  width: 320
+                  height: 240
+                  transparent: false
+                  clickable: false
+              - label:
+                  id: cctv_float_name
+                  text: "${cam1_name}"
+                  align: TOP_LEFT
+                  x: 4
+                  y: 4
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+                  bg_color: 0x000000
+                  bg_opa: 55%
+                  pad_all: 2
+                  radius: 4
+              - label:
+                  id: cctv_float_rec
+                  text: "REC"
+                  align: BOTTOM_LEFT
+                  x: 4
+                  y: -4
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+                  bg_color: 0xE74C3C
+                  bg_opa: COVER
+                  pad_all: 2
+                  radius: 4
+                  hidden: true
+              - label:
+                  id: cctv_float_status
+                  text: "Connecting..."
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xB7C0CC
+              - button:
+                  id: cctv_float_close
+                  align: TOP_RIGHT
+                  x: -3
+                  y: 3
+                  width: 24
+                  height: 24
+                  radius: 12
+                  bg_color: 0xE74C3C
+                  bg_opa: 85%
+                  shadow_width: 0
+                  pad_all: 0
+                  widgets:
+                    - label:
+                        text: "X"
+                        align: CENTER
+                        text_font: font_small
+                        text_color: 0xFFFFFF
+                  on_click:
+                    - globals.set:
+                        id: cctv_float_on
+                        value: 'false'
+                    - script.execute: cctv_float_apply
+              # Resize grip (bottom-right corner) - drag it to resize.
+              - obj:
+                  id: cctv_float_grip
+                  align: BOTTOM_RIGHT
+                  x: 0
+                  y: 0
+                  width: 26
+                  height: 26
+                  radius: 0
+                  bg_color: 0xFFC107
+                  bg_opa: 80%
+                  border_width: 0
+                  pad_all: 0
+                  scrollable: false
+                  on_pressing:
+                    - lambda: |-
+                        lv_indev_t *indev = lv_indev_get_act();
+                        if (indev == nullptr) return;
+                        lv_point_t v;
+                        lv_indev_get_vect(indev, &v);
+                        if (v.x == 0 && v.y == 0) return;
+                        lv_obj_t *w = id(cctv_float);
+                        lv_obj_t *scr = lv_obj_get_parent(w);
+                        const int sw = lv_obj_get_width(scr), sh = lv_obj_get_height(scr);
+                        // Lock to the camera's aspect once a frame has arrived
+                        // (the decoded frame already fits the window keeping
+                        // aspect), 4:3 until then.
+                        esp_rtsp_stream::RtspMjpeg *cams[4] = {id(cam1), id(cam2), id(cam3), id(cam4)};
+                        esp_rtsp_stream::RtspMjpeg *cam = cams[id(cctv_float_cam) & 3];
+                        float r = 4.0f / 3.0f;
+                        if (cam->has_frame() && cam->get_frame_height() > 0)
+                          r = (float) cam->get_frame_width() / cam->get_frame_height();
+                        // Follow whichever finger movement is bigger.
+                        const int dx = v.x, dy_as_w = (int) (v.y * r);
+                        const int d = abs(dx) >= abs(dy_as_w) ? dx : dy_as_w;
+                        const int x = lv_obj_get_x(w), y = lv_obj_get_y(w);
+                        float nw = lv_obj_get_width(w) + d;
+                        if (nw > sw - x) nw = sw - x;
+                        if (nw / r > sh - y) nw = (sh - y) * r;
+                        if (nw < 96) nw = 96;
+                        const int iw = (int) nw, ih = (int) (nw / r + 0.5f);
+                        lv_obj_set_size(w, iw, ih);
+                        cam->set_output_size(iw, ih);
+                  on_release:
+                    - lambda: |-
+                        id(cctv_w) = lv_obj_get_width(id(cctv_float));
+                        id(cctv_h) = lv_obj_get_height(id(cctv_float));
+            # Drag to move.
+            on_press:
+              - globals.set:
+                  id: cctv_drag_dist
+                  value: '0'
+            on_pressing:
+              - lambda: |-
+                  lv_indev_t *indev = lv_indev_get_act();
+                  if (indev == nullptr) return;
+                  lv_point_t v;
+                  lv_indev_get_vect(indev, &v);
+                  if (v.x == 0 && v.y == 0) return;
+                  id(cctv_drag_dist) += abs(v.x) + abs(v.y);
+                  lv_obj_t *w = id(cctv_float);
+                  lv_obj_t *scr = lv_obj_get_parent(w);
+                  const int sw = lv_obj_get_width(scr), sh = lv_obj_get_height(scr);
+                  int x = lv_obj_get_x(w) + v.x;
+                  int y = lv_obj_get_y(w) + v.y;
+                  x = std::max(0, std::min(x, sw - (int) lv_obj_get_width(w)));
+                  y = std::max(0, std::min(y, sh - (int) lv_obj_get_height(w)));
+                  lv_obj_set_pos(w, x, y);
+            on_release:
+              - lambda: |-
+                  id(cctv_x) = lv_obj_get_x(id(cctv_float));
+                  id(cctv_y) = lv_obj_get_y(id(cctv_float));
+            # A tap (not a drag) opens the full-screen CCTV page.
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return id(cctv_drag_dist) < 8;'
+                  then:
+                    - lambda: 'id(cctv_view_cam) = id(cctv_float_cam);'
+                    - globals.set:
+                        id: current_page
+                        value: '"cctv"'
+                    - lvgl.page.show: cctv_page
+
+    # ------------------------------------------------------------------
+    # CCTV PAGE - one camera, full width.
+    #   1-4   pick the camera (number turns red while that camera records)
+    #   REC   record this camera to the SD card (tap again to stop)
+    #   FLOAT pin this camera to the floating home-screen window
+    #   GRID  all four cameras at once
+    # ------------------------------------------------------------------
+    - id: cctv_page
+      bg_color: 0x11151C
+      on_load:
+        - script.execute: cctv_float_apply
+        - script.execute:
+            id: cctv_route
+            view: 1
+      widgets:
+        - canvas:
+            id: cctv_page_canvas
+            x: 0
+            y: 40
+            width: 320
+            height: 200
+            transparent: false
+            clickable: false
+        - label:
+            id: cctv_page_status
+            text: "Connecting..."
+            align: CENTER
+            y: 20
+            text_font: font_small
+            text_color: 0xB7C0CC
+        - label:
+            id: cctv_page_name
+            text: "${cam1_name}"
+            x: 6
+            y: 46
+            text_font: font_small
+            text_color: 0xFFFFFF
+            bg_color: 0x000000
+            bg_opa: 55%
+            pad_all: 3
+            radius: 4
+        - label:
+            id: cctv_page_rec
+            text: "REC"
+            align: TOP_RIGHT
+            x: -6
+            y: 46
+            text_font: font_small
+            text_color: 0xFFFFFF
+            bg_color: 0xE74C3C
+            bg_opa: COVER
+            pad_all: 3
+            radius: 4
+            hidden: true
+        - button:
+            id: cctv_sel_1
+            x: 6
+            y: 5
+            width: 40
+            height: 30
+            radius: 8
+            bg_color: 0x1F2632
+            shadow_width: 0
+            widgets:
+              - label:
+                  id: cctv_sel_1_label
+                  text: "1"
+                  align: CENTER
+                  text_font: font_medium
+                  text_color: 0xFFFFFF
+            on_click:
+              - globals.set:
+                  id: cctv_view_cam
+                  value: '0'
+              - script.execute: cctv_page_refresh
+              - script.execute:
+                  id: cctv_route
+                  view: 1
+        - button:
+            id: cctv_sel_2
+            x: 50
+            y: 5
+            width: 40
+            height: 30
+            radius: 8
+            bg_color: 0x1F2632
+            shadow_width: 0
+            widgets:
+              - label:
+                  id: cctv_sel_2_label
+                  text: "2"
+                  align: CENTER
+                  text_font: font_medium
+                  text_color: 0xFFFFFF
+            on_click:
+              - globals.set:
+                  id: cctv_view_cam
+                  value: '1'
+              - script.execute: cctv_page_refresh
+              - script.execute:
+                  id: cctv_route
+                  view: 1
+        - button:
+            id: cctv_sel_3
+            x: 94
+            y: 5
+            width: 40
+            height: 30
+            radius: 8
+            bg_color: 0x1F2632
+            shadow_width: 0
+            widgets:
+              - label:
+                  id: cctv_sel_3_label
+                  text: "3"
+                  align: CENTER
+                  text_font: font_medium
+                  text_color: 0xFFFFFF
+            on_click:
+              - globals.set:
+                  id: cctv_view_cam
+                  value: '2'
+              - script.execute: cctv_page_refresh
+              - script.execute:
+                  id: cctv_route
+                  view: 1
+        - button:
+            id: cctv_sel_4
+            x: 138
+            y: 5
+            width: 40
+            height: 30
+            radius: 8
+            bg_color: 0x1F2632
+            shadow_width: 0
+            widgets:
+              - label:
+                  id: cctv_sel_4_label
+                  text: "4"
+                  align: CENTER
+                  text_font: font_medium
+                  text_color: 0xFFFFFF
+            on_click:
+              - globals.set:
+                  id: cctv_view_cam
+                  value: '3'
+              - script.execute: cctv_page_refresh
+              - script.execute:
+                  id: cctv_route
+                  view: 1
+        - button:
+            id: cctv_grid_btn
+            align: TOP_RIGHT
+            x: -72
+            y: 5
+            width: 60
+            height: 30
+            radius: 8
+            bg_color: 0x3D7BFF
+            shadow_width: 0
+            widgets:
+              - label:
+                  text: "GRID"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - globals.set:
+                  id: current_page
+                  value: '"cctv_grid"'
+              - lvgl.page.show: cctv_grid_page
+        - button:
+            id: exit_cctv_btn
+            align: TOP_RIGHT
+            x: -6
+            y: 5
+            width: 60
+            height: 30
+            radius: 8
+            bg_color: 0x1F2632
+            shadow_width: 0
+            widgets:
+              - label:
+                  text: "HOME"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - globals.set:
+                  id: current_page
+                  value: '"home"'
+              - lvgl.page.show: home_page
+        # Record the camera you're viewing.
+        - button:
+            id: cctv_rec_btn
+            align: BOTTOM_LEFT
+            x: 6
+            y: -6
+            width: 104
+            height: 32
+            radius: 8
+            bg_color: 0x1F2632
+            bg_opa: 85%
+            shadow_width: 0
+            widgets:
+              - label:
+                  id: cctv_rec_btn_label
+                  text: "REC"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - lambda: |-
+                  esp_rtsp_stream::RtspMjpeg *cams[4] = {id(cam1), id(cam2), id(cam3), id(cam4)};
+                  const int v = id(cctv_view_cam) & 3;
+                  id(cctv_rec_set)->execute(v, !cams[v]->is_recording());
+        # Pin the camera you're viewing to the floating home-screen window.
+        - button:
+            id: cctv_float_btn
+            align: BOTTOM_RIGHT
+            x: -6
+            y: -6
+            width: 104
+            height: 32
+            radius: 8
+            bg_color: 0x1F2632
+            bg_opa: 85%
+            shadow_width: 0
+            widgets:
+              - label:
+                  id: cctv_float_btn_label
+                  text: "FLOAT"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - lambda: |-
+                  if (id(cctv_float_on) && id(cctv_float_cam) == id(cctv_view_cam)) {
+                    id(cctv_float_on) = false;
+                  } else {
+                    id(cctv_float_cam) = id(cctv_view_cam);
+                    id(cctv_float_on) = true;
+                  }
+              - script.execute: cctv_float_apply
+
+    # ------------------------------------------------------------------
+    # GRID PAGE - all four cameras, 2x2, full screen.
+    # Tap a camera to open it on the CCTV page; X goes back.
+    # ------------------------------------------------------------------
+    - id: cctv_grid_page
+      bg_color: 0x000000
+      on_load:
+        - script.execute:
+            id: cctv_route
+            view: 3
+      widgets:
+        - canvas:
+            id: cctv_grid_canvas_1
+            x: 0
+            y: 0
+            width: 160
+            height: 120
+            transparent: false
+            clickable: true
+            on_click:
+              - globals.set:
+                  id: cctv_view_cam
+                  value: '0'
+              - globals.set:
+                  id: current_page
+                  value: '"cctv"'
+              - lvgl.page.show: cctv_page
+        - label:
+            text: "${cam1_name}"
+            x: 4
+            y: 4
+            text_font: font_small
+            text_color: 0xFFFFFF
+            bg_color: 0x000000
+            bg_opa: 55%
+            pad_all: 2
+            radius: 4
+        - label:
+            id: cctv_grid_rec_1
+            text: "REC"
+            x: 116
+            y: 4
+            text_font: font_small
+            text_color: 0xFFFFFF
+            bg_color: 0xE74C3C
+            bg_opa: COVER
+            pad_all: 2
+            radius: 4
+            hidden: true
+        - label:
+            id: cctv_grid_status_1
+            text: "Connecting..."
+            align: CENTER
+            x: -80
+            y: -60
+            text_font: font_small
+            text_color: 0xB7C0CC
+        - canvas:
+            id: cctv_grid_canvas_2
+            x: 160
+            y: 0
+            width: 160
+            height: 120
+            transparent: false
+            clickable: true
+            on_click:
+              - globals.set:
+                  id: cctv_view_cam
+                  value: '1'
+              - globals.set:
+                  id: current_page
+                  value: '"cctv"'
+              - lvgl.page.show: cctv_page
+        - label:
+            text: "${cam2_name}"
+            x: 164
+            y: 4
+            text_font: font_small
+            text_color: 0xFFFFFF
+            bg_color: 0x000000
+            bg_opa: 55%
+            pad_all: 2
+            radius: 4
+        - label:
+            id: cctv_grid_rec_2
+            text: "REC"
+            x: 276
+            y: 4
+            text_font: font_small
+            text_color: 0xFFFFFF
+            bg_color: 0xE74C3C
+            bg_opa: COVER
+            pad_all: 2
+            radius: 4
+            hidden: true
+        - label:
+            id: cctv_grid_status_2
+            text: "Connecting..."
+            align: CENTER
+            x: 80
+            y: -60
+            text_font: font_small
+            text_color: 0xB7C0CC
+        - canvas:
+            id: cctv_grid_canvas_3
+            x: 0
+            y: 120
+            width: 160
+            height: 120
+            transparent: false
+            clickable: true
+            on_click:
+              - globals.set:
+                  id: cctv_view_cam
+                  value: '2'
+              - globals.set:
+                  id: current_page
+                  value: '"cctv"'
+              - lvgl.page.show: cctv_page
+        - label:
+            text: "${cam3_name}"
+            x: 4
+            y: 124
+            text_font: font_small
+            text_color: 0xFFFFFF
+            bg_color: 0x000000
+            bg_opa: 55%
+            pad_all: 2
+            radius: 4
+        - label:
+            id: cctv_grid_rec_3
+            text: "REC"
+            x: 116
+            y: 124
+            text_font: font_small
+            text_color: 0xFFFFFF
+            bg_color: 0xE74C3C
+            bg_opa: COVER
+            pad_all: 2
+            radius: 4
+            hidden: true
+        - label:
+            id: cctv_grid_status_3
+            text: "Connecting..."
+            align: CENTER
+            x: -80
+            y: 60
+            text_font: font_small
+            text_color: 0xB7C0CC
+        - canvas:
+            id: cctv_grid_canvas_4
+            x: 160
+            y: 120
+            width: 160
+            height: 120
+            transparent: false
+            clickable: true
+            on_click:
+              - globals.set:
+                  id: cctv_view_cam
+                  value: '3'
+              - globals.set:
+                  id: current_page
+                  value: '"cctv"'
+              - lvgl.page.show: cctv_page
+        - label:
+            text: "${cam4_name}"
+            x: 164
+            y: 124
+            text_font: font_small
+            text_color: 0xFFFFFF
+            bg_color: 0x000000
+            bg_opa: 55%
+            pad_all: 2
+            radius: 4
+        - label:
+            id: cctv_grid_rec_4
+            text: "REC"
+            x: 276
+            y: 124
+            text_font: font_small
+            text_color: 0xFFFFFF
+            bg_color: 0xE74C3C
+            bg_opa: COVER
+            pad_all: 2
+            radius: 4
+            hidden: true
+        - label:
+            id: cctv_grid_status_4
+            text: "Connecting..."
+            align: CENTER
+            x: 80
+            y: 60
+            text_font: font_small
+            text_color: 0xB7C0CC
+        - obj:
+            x: 159
+            y: 0
+            width: 2
+            height: 240
+            radius: 0
+            bg_color: 0x333A45
+            border_width: 0
+            clickable: false
+        - obj:
+            x: 0
+            y: 119
+            width: 320
+            height: 2
+            radius: 0
+            bg_color: 0x333A45
+            border_width: 0
+            clickable: false
+        - button:
+            id: cctv_grid_exit_btn
+            align: CENTER
+            width: 40
+            height: 40
+            radius: 20
+            bg_color: 0xE74C3C
+            bg_opa: 85%
+            shadow_width: 0
+            widgets:
+              - label:
+                  text: "X"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - globals.set:
+                  id: current_page
+                  value: '"cctv"'
+              - lvgl.page.show: cctv_page
+
+# =============================================================================
+# Home Assistant entities
+# =============================================================================
+switch:
+  - platform: template
+    id: rec_switch_1
+    name: "Record ${cam1_name}"
+    icon: mdi:record-rec
+    lambda: 'return id(cam1).is_recording();'
+    turn_on_action:
+      - script.execute:
+          id: cctv_rec_set
+          cam: 0
+          enable: true
+    turn_off_action:
+      - script.execute:
+          id: cctv_rec_set
+          cam: 0
+          enable: false
+  - platform: template
+    id: rec_switch_2
+    name: "Record ${cam2_name}"
+    icon: mdi:record-rec
+    lambda: 'return id(cam2).is_recording();'
+    turn_on_action:
+      - script.execute:
+          id: cctv_rec_set
+          cam: 1
+          enable: true
+    turn_off_action:
+      - script.execute:
+          id: cctv_rec_set
+          cam: 1
+          enable: false
+  - platform: template
+    id: rec_switch_3
+    name: "Record ${cam3_name}"
+    icon: mdi:record-rec
+    lambda: 'return id(cam3).is_recording();'
+    turn_on_action:
+      - script.execute:
+          id: cctv_rec_set
+          cam: 2
+          enable: true
+    turn_off_action:
+      - script.execute:
+          id: cctv_rec_set
+          cam: 2
+          enable: false
+  - platform: template
+    id: rec_switch_4
+    name: "Record ${cam4_name}"
+    icon: mdi:record-rec
+    lambda: 'return id(cam4).is_recording();'
+    turn_on_action:
+      - script.execute:
+          id: cctv_rec_set
+          cam: 3
+          enable: true
+    turn_off_action:
+      - script.execute:
+          id: cctv_rec_set
+          cam: 3
+          enable: false
+  - platform: template
+    id: cctv_float_switch
+    name: "CCTV Floating Window"
+    icon: mdi:cctv
+    lambda: 'return id(cctv_float_on);'
+    turn_on_action:
+      - globals.set:
+          id: cctv_float_on
+          value: 'true'
+      - script.execute: cctv_float_apply
+    turn_off_action:
+      - globals.set:
+          id: cctv_float_on
+          value: 'false'
+      - script.execute: cctv_float_apply
+
+select:
+  - platform: template
+    id: cctv_float_cam_select
+    name: "CCTV Floating Camera"
+    icon: mdi:cctv
+    update_interval: 5s
+    options:
+      - "${cam1_name}"
+      - "${cam2_name}"
+      - "${cam3_name}"
+      - "${cam4_name}"
+    lambda: |-
+      const char *names[4] = {"${cam1_name}", "${cam2_name}", "${cam3_name}", "${cam4_name}"};
+      return std::string(names[id(cctv_float_cam) & 3]);
+    set_action:
+      - lambda: |-
+          const char *names[4] = {"${cam1_name}", "${cam2_name}", "${cam3_name}", "${cam4_name}"};
+          for (int i = 0; i < 4; i++) {
+            if (x == names[i]) {
+              id(cctv_float_cam) = i;
+              break;
+            }
+          }
+      - script.execute: cctv_float_apply
+      - if:
+          condition:
+            lambda: 'return id(current_page) == "home";'
+          then:
+            - script.execute:
+                id: cctv_route
+                view: 2
+
+button:
+  - platform: template
+    name: "Record All Cameras"
+    icon: mdi:record-rec
+    on_press:
+      - lambda: |-
+          for (int i = 0; i < 4; i++) id(cctv_rec_set)->execute(i, true);
+  - platform: template
+    name: "Stop All Recordings"
+    icon: mdi:stop
+    on_press:
+      - lambda: |-
+          for (int i = 0; i < 4; i++) id(cctv_rec_set)->execute(i, false);
+
+sensor:
+  - platform: template
+    name: "SD Card Free"
+    icon: mdi:sd
+    unit_of_measurement: GB
+    accuracy_decimals: 1
+    update_interval: 60s
+    lambda: |-
+      if (!id(sd_card).is_mounted()) return NAN;
+      return id(sd_card).get_free_gb();
+  - platform: template
+    name: "SD Card Size"
+    icon: mdi:sd
+    unit_of_measurement: GB
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: 300s
+    lambda: |-
+      if (!id(sd_card).is_mounted()) return NAN;
+      return id(sd_card).get_total_gb();
+  - platform: template
+    name: "Recordings on SD"
+    icon: mdi:filmstrip
+    unit_of_measurement: files
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: 'return id(sd_card).get_recording_count();'
