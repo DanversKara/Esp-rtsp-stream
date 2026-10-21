@@ -48,6 +48,11 @@ class RtspMjpeg : public Component {
     this->box_height_ = height;
   }
   void set_rotation(int degrees) { this->rotation_ = degrees; }
+  /// How the picture fits its box: 0 = FIT (keep shape, black bars, never enlarge),
+  /// 1 = STRETCH (fill the box exactly, shape may distort), 2 = CROP (fill the box,
+  /// keep shape, centre-crop the overflow; may enlarge). Runtime-switchable per view.
+  void set_aspect_mode(int mode) { this->aspect_mode_ = mode; }
+  int get_aspect_mode() const { return this->aspect_mode_.load(); }
   void set_max_frame_size(size_t bytes) { this->max_frame_size_ = bytes; }
   void set_task_cores(int network_core, int decode_core) {
     this->network_core_ = network_core;
@@ -146,6 +151,7 @@ class RtspMjpeg : public Component {
   std::string username_;
   std::string password_;
   int max_fps_{10};
+  std::atomic<int> aspect_mode_{0};
   int box_width_{0};
   int box_height_{0};
   int rotation_{0};

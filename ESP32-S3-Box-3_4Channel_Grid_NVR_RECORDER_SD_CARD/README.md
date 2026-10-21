@@ -1,7 +1,7 @@
-# CCTV Box v5 "NVR" — hybrid build
+# CCTV Box v6 "NVR" — hybrid build
 
 4-camera viewer + SD-card recorder for the ESP32-S3-BOX-3
-(+ BOX-3-SENSOR base for the microSD slot). Supersedes v4.
+(+ BOX-3-SENSOR base for the microSD slot). Supersedes v5.
 
 ## How this build is put together
 
@@ -13,15 +13,30 @@
 
 ## Screens (no floating windows anymore)
 
-- **Viewer = the home page.** One camera full-screen at 320x240 — exact 1:1
-  with the stream, no pillarbox, no stretch. Overlay buttons on the video:
-  **1 2 3 4** pick a camera, **REC** records the camera you're viewing,
-  **GRID** shows all four. Camera name, clock, REC badge and SD free space
-  are overlaid at the top.
-- **Grid.** All four cameras 2x2 at 160x120 — exact 1:2 scale of the same
-  streams (no second connection per camera). Tap a cell to open that camera
-  in the viewer; the red X returns to the viewer.
+- **Viewer = the home page.** One camera full-screen at 320x240. The bottom
+  button bar is **hidden** — tap the picture to show it, it hides again
+  after 5 s: **1 2 3 4** pick a camera, **FIT/STR/CROP** cycles the picture
+  fit, **REC** records the camera you're viewing, **GRID** shows all four.
+  Top row: camera name + REC badge (left), clock (centre), WiFi and Home
+  Assistant status icons (green = connected) and SD free space (top right).
+- **Grid.** All four cameras 2x2 at 160x120 from the same streams (no second
+  connection per camera). The **FIT/STR/CROP** button at the top centre sets
+  the grid's fit independently of the viewer's. Tap a cell to open that
+  camera in the viewer; the red X returns to the viewer.
 - The physical red home button under the screen returns to the viewer.
+
+## Picture fit modes (viewer and grid, saved per screen)
+
+| Mode | What it does |
+|---|---|
+| FIT | Keeps the shape, fits inside the screen, black bars if the shapes differ. Never enlarges. |
+| STR | Stretches/squashes to fill the screen exactly. No bars, no cropping, shape may distort. |
+| CROP | Fills the screen keeping the shape, centre-cropping whatever overflows. May enlarge a small stream. |
+
+With a 320x240 stream all three look identical in the viewer (1:1) and the
+grid (1:2) — the modes matter when a stream's shape differs, e.g. a 16:9
+RTSP feed in the 4:3 screen: FIT letterboxes it, CROP fills and trims
+the sides, STR squashes it.
 
 ## Cameras
 

@@ -1,5 +1,5 @@
 # =============================================================================
-# CCTV Box v5 "NVR" - 4-camera viewer + SD-card recorder for the
+# CCTV Box v6 "NVR" - 4-camera viewer + SD-card recorder for the
 # ESP32-S3-BOX-3 (+ BOX-3-SENSOR base for its microSD slot)
 # -----------------------------------------------------------------------------
 # Built as a hybrid, per the design review:
@@ -14,10 +14,15 @@
 #             MJPEG AVI recording + the cctv_sdcard component.
 #
 #  Screens (NO floating windows):
-#   Viewer   the HOME page. One camera full-screen 320x240 (exact 1:1 with
-#            the stream), overlay buttons: 1 2 3 4 | REC | GRID.
-#   Grid     all four cameras 2x2 at 160x120 (exact 1:2 from the same
-#            streams). Tap a cell to open it in the viewer; X goes back.
+#   Viewer   the HOME page. One camera full-screen 320x240. The bottom
+#            button bar (1 2 3 4 | FIT/STR/CROP | REC | GRID) is HIDDEN -
+#            tap the picture to show it, it hides again after 5 s.
+#   Grid     all four cameras 2x2 at 160x120 from the same streams.
+#            Tap a cell to open it in the viewer; X goes back.
+#   FIT/STR/CROP: per-screen picture fit, cycled by the mode button
+#            (viewer bar, and top-centre on the grid). FIT = keep shape,
+#            black bars. STR = stretch to fill exactly. CROP = fill and
+#            centre-crop the overflow. Saved across reboots, per screen.
 #  Recordings: /sdcard/cctv/<YYYYMMDD_HHMMSS>_<name>.avi (Motion-JPEG AVI,
 #  plays in VLC), split every few minutes, oldest deleted below 1 GB free.
 #  Recording writes the raw stream frames, not the scaled screen picture.
@@ -58,7 +63,7 @@ esphome:
   min_version: 2026.4.0
   project:
     name: "Christian.s3box3"
-    version: "5.0.0"
+    version: "6.0.0"
   on_boot:
     # Resume recordings that were on before a reboot, once the clock is set
     # (file names use the date/time).
@@ -330,6 +335,24 @@ globals:
     type: int
     restore_value: true
     initial_value: '0'
+  # Picture fit per screen: 0 = FIT, 1 = STRETCH, 2 = CROP. Saved.
+  - id: viewer_aspect
+    type: int
+    restore_value: true
+    initial_value: '0'
+  - id: grid_aspect
+    type: int
+    restore_value: true
+    initial_value: '0'
+  # Viewer bottom button bar: hidden until the picture is tapped.
+  - id: viewer_bar_on
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: viewer_bar_ticks
+    type: int
+    restore_value: false
+    initial_value: '0'
   # Which cameras are recording (bit 0 = cam1), restored after a reboot.
   - id: rec_mask
     type: int
@@ -354,18 +377,40 @@ script:
           RtspMjpeg *cams[4] = {id(cam1), id(cam2), id(cam3), id(cam4)};
           static lv_obj_t *parked = nullptr;
           for (RtspMjpeg *c : cams) c->set_lvgl_canvas(&parked);
-          auto attach = [](RtspMjpeg *c, lv_obj_t **canvas, int w, int h, int fps) {
+          auto attach = [](RtspMjpeg *c, lv_obj_t **canvas, int w, int h, int fps, int mode) {
             lv_canvas_fill_bg(*canvas, lv_color_hex(0x000000), LV_OPA_COVER);
             c->set_output_size(w, h);
             c->set_max_fps(fps);
+            c->set_aspect_mode(mode);
             c->set_lvgl_canvas(canvas);
           };
           if (view == 1) {
-            attach(cams[id(cctv_view_cam) & 3], &id(viewer_canvas), 320, 240, ${cctv_single_fps});
+            attach(cams[id(cctv_view_cam) & 3], &id(viewer_canvas), 320, 240, ${cctv_single_fps},
+                   id(viewer_aspect));
           } else if (view == 3) {
             lv_obj_t **grid[4] = {&id(cctv_grid_canvas_1), &id(cctv_grid_canvas_2),
                                   &id(cctv_grid_canvas_3), &id(cctv_grid_canvas_4)};
-            for (int i = 0; i < 4; i++) attach(cams[i], grid[i], 160, 120, ${cctv_grid_fps});
+            for (int i = 0; i < 4; i++) attach(cams[i], grid[i], 160, 120, ${cctv_grid_fps},
+                                               id(grid_aspect));
+          }
+
+  #── Mode button labels: FIT / STR / CROP for the viewer and the grid ──
+  - id: aspect_refresh
+    then:
+      - lambda: |-
+          const char *names[3] = {"FIT", "STR", "CROP"};
+          lv_label_set_text(id(viewer_mode_label), names[std::max(0, std::min(2, id(viewer_aspect)))]);
+          lv_label_set_text(id(grid_mode_label), names[std::max(0, std::min(2, id(grid_aspect)))]);
+
+  #── Viewer bottom bar: show/hide the bar background and all its buttons ──
+  - id: viewer_bar_apply
+    then:
+      - lambda: |-
+          lv_obj_t *items[8] = {id(viewer_bar_bg), id(cctv_sel_1), id(cctv_sel_2), id(cctv_sel_3),
+                                id(cctv_sel_4), id(viewer_mode_btn), id(cctv_rec_btn), id(cctv_grid_btn)};
+          for (lv_obj_t *o : items) {
+            if (id(viewer_bar_on)) lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+            else lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
           }
 
   #── Viewer page: camera name, highlighted 1-4 button, REC button state ──
@@ -445,6 +490,10 @@ interval:
           else snprintf(sd, sizeof(sd), "NO SD");
           lv_label_set_text(id(viewer_sd), sd);
           lv_obj_set_style_text_color(id(viewer_sd), lv_color_hex(id(sd_card).is_mounted() ? 0xFFFFFF : 0xE67E22), 0);
+          const bool wifi_ok = wifi::global_wifi_component->is_connected();
+          const bool api_ok = api::global_api_server->is_connected();
+          lv_obj_set_style_text_color(id(wifi_icon), lv_color_hex(wifi_ok ? 0x2ECC71 : 0xE74C3C), 0);
+          lv_obj_set_style_text_color(id(ha_icon), lv_color_hex(api_ok ? 0x2ECC71 : 0xE74C3C), 0);
 
           using esp_rtsp_stream::RtspMjpeg;
           RtspMjpeg *cams[4] = {id(cam1), id(cam2), id(cam3), id(cam4)};
@@ -462,6 +511,12 @@ interval:
                                id(cctv_grid_status_3), id(cctv_grid_status_4)};
           for (int i = 0; i < 4; i++) show(grid[i], cams[i]);
           id(rec_blink) = !id(rec_blink);
+      # Auto-hide the viewer's bottom button bar 5 s after it was shown.
+      - lambda: |-
+          if (id(viewer_bar_on) && ++id(viewer_bar_ticks) >= 5) {
+            id(viewer_bar_on) = false;
+            id(viewer_bar_apply)->execute();
+          }
       - script.execute: cctv_rec_refresh
 
 # =============================================================================
@@ -476,16 +531,18 @@ lvgl:
   pages:
     # ------------------------------------------------------------------
     # VIEWER - the home page. One camera, full screen 320x240.
-    #   1-4   pick the camera (number turns red while that camera records)
-    #   REC   record the camera you're viewing (tap again to stop)
-    #   GRID  all four cameras at once
-    # The buttons sit ON the video (semi-transparent bar at the bottom),
-    # so the picture keeps the full 320x240 - exact 1:1 with the stream.
+    #   Tap the picture to show the bottom button bar (auto-hides in 5 s):
+    #   1-4 pick the camera, FIT/STR/CROP cycles the picture fit, REC
+    #   records the camera you're viewing, GRID shows all four.
+    # Top row: camera name + REC badge (left), clock + WiFi/HA icons
+    # (centre/right), SD free space (top right corner).
     # ------------------------------------------------------------------
     - id: home_page
       bg_color: 0x000000
       on_load:
         - script.execute: viewer_refresh
+        - script.execute: aspect_refresh
+        - script.execute: viewer_bar_apply
         - script.execute:
             id: cctv_route
             view: 1
@@ -497,7 +554,12 @@ lvgl:
             width: 320
             height: 240
             transparent: false
-            clickable: false
+            clickable: true
+            on_click:
+              - lambda: |-
+                  id(viewer_bar_on) = !id(viewer_bar_on);
+                  id(viewer_bar_ticks) = 0;
+              - script.execute: viewer_bar_apply
         - label:
             id: viewer_status
             text: "Connecting..."
@@ -529,9 +591,8 @@ lvgl:
         - label:
             id: viewer_rec
             text: "REC"
-            align: TOP_RIGHT
-            x: -6
-            y: 6
+            x: 6
+            y: 30
             text_font: font_small
             text_color: 0xFFFFFF
             bg_color: 0xE74C3C
@@ -539,12 +600,37 @@ lvgl:
             pad_all: 3
             radius: 4
             hidden: true
+        # Top-right cluster: WiFi + Home Assistant status icons, SD free.
+        - label:
+            id: wifi_icon
+            text: "\uF1EB"
+            align: TOP_RIGHT
+            x: -118
+            y: 8
+            text_font: montserrat_18
+            text_color: 0xE74C3C
+            bg_color: 0x000000
+            bg_opa: 55%
+            pad_all: 2
+            radius: 4
+        - label:
+            id: ha_icon
+            text: "\uF015"
+            align: TOP_RIGHT
+            x: -92
+            y: 8
+            text_font: montserrat_18
+            text_color: 0xE74C3C
+            bg_color: 0x000000
+            bg_opa: 55%
+            pad_all: 2
+            radius: 4
         - label:
             id: viewer_sd
             text: "NO SD"
             align: TOP_RIGHT
             x: -6
-            y: 30
+            y: 6
             text_font: font_small
             text_color: 0xE67E22
             bg_color: 0x000000
@@ -552,7 +638,10 @@ lvgl:
             pad_all: 3
             radius: 4
         # Bottom overlay bar (visual only - the buttons below sit on it).
+        # Hidden until the picture is tapped; viewer_bar_apply shows/hides
+        # the bar and its buttons together.
         - obj:
+            id: viewer_bar_bg
             x: 0
             y: 202
             width: 320
@@ -564,16 +653,18 @@ lvgl:
             pad_all: 0
             scrollable: false
             clickable: false
+            hidden: true
         - button:
             id: cctv_sel_1
-            x: 6
+            x: 4
             y: 205
-            width: 40
+            width: 34
             height: 32
             radius: 8
             bg_color: 0x1F2632
             bg_opa: 85%
             shadow_width: 0
+            hidden: true
             widgets:
               - label:
                   id: cctv_sel_1_label
@@ -582,6 +673,7 @@ lvgl:
                   text_font: font_medium
                   text_color: 0xFFFFFF
             on_click:
+              - lambda: 'id(viewer_bar_ticks) = 0;'
               - globals.set:
                   id: cctv_view_cam
                   value: '0'
@@ -591,14 +683,15 @@ lvgl:
                   view: 1
         - button:
             id: cctv_sel_2
-            x: 50
+            x: 42
             y: 205
-            width: 40
+            width: 34
             height: 32
             radius: 8
             bg_color: 0x1F2632
             bg_opa: 85%
             shadow_width: 0
+            hidden: true
             widgets:
               - label:
                   id: cctv_sel_2_label
@@ -607,6 +700,7 @@ lvgl:
                   text_font: font_medium
                   text_color: 0xFFFFFF
             on_click:
+              - lambda: 'id(viewer_bar_ticks) = 0;'
               - globals.set:
                   id: cctv_view_cam
                   value: '1'
@@ -616,14 +710,15 @@ lvgl:
                   view: 1
         - button:
             id: cctv_sel_3
-            x: 94
+            x: 80
             y: 205
-            width: 40
+            width: 34
             height: 32
             radius: 8
             bg_color: 0x1F2632
             bg_opa: 85%
             shadow_width: 0
+            hidden: true
             widgets:
               - label:
                   id: cctv_sel_3_label
@@ -632,6 +727,7 @@ lvgl:
                   text_font: font_medium
                   text_color: 0xFFFFFF
             on_click:
+              - lambda: 'id(viewer_bar_ticks) = 0;'
               - globals.set:
                   id: cctv_view_cam
                   value: '2'
@@ -641,14 +737,15 @@ lvgl:
                   view: 1
         - button:
             id: cctv_sel_4
-            x: 138
+            x: 118
             y: 205
-            width: 40
+            width: 34
             height: 32
             radius: 8
             bg_color: 0x1F2632
             bg_opa: 85%
             shadow_width: 0
+            hidden: true
             widgets:
               - label:
                   id: cctv_sel_4_label
@@ -657,6 +754,7 @@ lvgl:
                   text_font: font_medium
                   text_color: 0xFFFFFF
             on_click:
+              - lambda: 'id(viewer_bar_ticks) = 0;'
               - globals.set:
                   id: cctv_view_cam
                   value: '3'
@@ -664,17 +762,45 @@ lvgl:
               - script.execute:
                   id: cctv_route
                   view: 1
-        # Record the camera you're viewing.
+        # Picture fit for the viewer: cycles FIT -> STR (stretch) -> CROP.
         - button:
-            id: cctv_rec_btn
-            x: 184
+            id: viewer_mode_btn
+            x: 156
             y: 205
-            width: 62
+            width: 52
             height: 32
             radius: 8
             bg_color: 0x1F2632
             bg_opa: 85%
             shadow_width: 0
+            hidden: true
+            widgets:
+              - label:
+                  id: viewer_mode_label
+                  text: "FIT"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - lambda: |-
+                  id(viewer_bar_ticks) = 0;
+                  id(viewer_aspect) = (id(viewer_aspect) + 1) % 3;
+              - script.execute: aspect_refresh
+              - script.execute:
+                  id: cctv_route
+                  view: 1
+        # Record the camera you're viewing.
+        - button:
+            id: cctv_rec_btn
+            x: 212
+            y: 205
+            width: 48
+            height: 32
+            radius: 8
+            bg_color: 0x1F2632
+            bg_opa: 85%
+            shadow_width: 0
+            hidden: true
             widgets:
               - label:
                   id: cctv_rec_btn_label
@@ -683,20 +809,22 @@ lvgl:
                   text_font: font_small
                   text_color: 0xFFFFFF
             on_click:
+              - lambda: 'id(viewer_bar_ticks) = 0;'
               - lambda: |-
                   esp_rtsp_stream::RtspMjpeg *cams[4] = {id(cam1), id(cam2), id(cam3), id(cam4)};
                   const int v = id(cctv_view_cam) & 3;
                   id(cctv_rec_set)->execute(v, !cams[v]->is_recording());
         - button:
             id: cctv_grid_btn
-            x: 252
+            x: 264
             y: 205
-            width: 62
+            width: 52
             height: 32
             radius: 8
             bg_color: 0x3D7BFF
             bg_opa: 85%
             shadow_width: 0
+            hidden: true
             widgets:
               - label:
                   text: "GRID"
@@ -704,6 +832,7 @@ lvgl:
                   text_font: font_small
                   text_color: 0xFFFFFF
             on_click:
+              - lambda: 'id(viewer_bar_ticks) = 0;'
               - globals.set:
                   id: current_page
                   value: '"cctv_grid"'
@@ -716,6 +845,7 @@ lvgl:
     - id: cctv_grid_page
       bg_color: 0x000000
       on_load:
+        - script.execute: aspect_refresh
         - script.execute:
             id: cctv_route
             view: 3
@@ -942,6 +1072,31 @@ lvgl:
                   id: current_page
                   value: '"home"'
               - lvgl.page.show: home_page
+        # Picture fit for the grid: cycles FIT -> STR (stretch) -> CROP.
+        # Declared last so it sits on top of the four cells.
+        - button:
+            id: grid_mode_btn
+            align: TOP_MID
+            y: 2
+            width: 56
+            height: 24
+            radius: 8
+            bg_color: 0x1F2632
+            bg_opa: 85%
+            shadow_width: 0
+            widgets:
+              - label:
+                  id: grid_mode_label
+                  text: "FIT"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - lambda: 'id(grid_aspect) = (id(grid_aspect) + 1) % 3;'
+              - script.execute: aspect_refresh
+              - script.execute:
+                  id: cctv_route
+                  view: 3
 
 # =============================================================================
 # Home Assistant entities + scratch-base sensors/switches (single blocks)

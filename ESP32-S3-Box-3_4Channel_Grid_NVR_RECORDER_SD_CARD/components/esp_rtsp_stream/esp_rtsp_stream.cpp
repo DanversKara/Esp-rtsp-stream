@@ -670,19 +670,38 @@ void RtspMjpeg::decode_loop_() {
 
 RtspMjpeg::OutputPlan RtspMjpeg::plan_output_(int src_width, int src_height) const {
   const bool swap = this->rotation_ == 90 || this->rotation_ == 270;
+  const int mode = this->aspect_mode_.load();
   float scale = 1.0f;
+  int target_w = src_width;
+  int target_h = src_height;
   if (this->box_width_ > 0 && this->box_height_ > 0) {
     // The box is in display orientation; compare it with the source before rotation.
     const int box_w = swap ? this->box_height_ : this->box_width_;
     const int box_h = swap ? this->box_width_ : this->box_height_;
-    scale = std::min({1.0f, static_cast<float>(box_w) / src_width, static_cast<float>(box_h) / src_height});
+    if (mode == 1) {
+      // STRETCH: fill the box exactly; the axes scale independently in finish_frame_().
+      target_w = box_w;
+      target_h = box_h;
+      scale = std::min(static_cast<float>(box_w) / src_width, static_cast<float>(box_h) / src_height);
+    } else if (mode == 2) {
+      // CROP (fill): scale to cover the box, keeping the shape (enlarging if the stream
+      // is smaller than the box). update_lvgl_canvas_() centre-crops the overflow.
+      scale = std::max(static_cast<float>(box_w) / src_width, static_cast<float>(box_h) / src_height);
+      target_w = std::max(1, static_cast<int>(src_width * scale + 0.5f));
+      target_h = std::max(1, static_cast<int>(src_height * scale + 0.5f));
+    } else {
+      // FIT: keep the shape, fit inside the box, never enlarge.
+      scale = std::min({1.0f, static_cast<float>(box_w) / src_width, static_cast<float>(box_h) / src_height});
+      target_w = std::max(1, static_cast<int>(src_width * scale + 0.01f));
+      target_h = std::max(1, static_cast<int>(src_height * scale + 0.01f));
+    }
   }
 
-  // The exact aspect-preserving size. The hardware scalers can only get close to it, so they
-  // aim at the next size up and resize_rgb565() closes the last few pixels.
+  // The exact size the frame is finished at. The hardware scalers can only get close to
+  // it, so they aim at the next size up and resize_rgb565() closes the last few pixels.
   OutputPlan plan;
-  plan.target_width = std::max(1, static_cast<int>(src_width * scale + 0.01f));
-  plan.target_height = std::max(1, static_cast<int>(src_height * scale + 0.01f));
+  plan.target_width = target_w;
+  plan.target_height = target_h;
 #ifdef USE_ESP_RTSP_STREAM_HW_JPEG
   // PPA scale factors have 1/16 resolution.
   plan.scale = std::min(1.0f, std::max(1.0f / 16, std::ceil(scale * 16 - 0.01f) / 16));
