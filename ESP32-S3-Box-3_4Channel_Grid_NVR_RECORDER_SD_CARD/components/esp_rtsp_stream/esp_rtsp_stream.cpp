@@ -158,7 +158,7 @@ void RtspMjpeg::network_loop_() {
       backoff_ms = 1000;
       continue;
     }
-    backoff_ms = got_frames ? 1000 : std::min<uint32_t>(backoff_ms * 2, 30000);
+    backoff_ms = got_frames ? 1000 : std::min<uint32_t>(backoff_ms * 2, 10000);
     ESP_LOGW(TAG, "%s stopped, reconnecting in %u s", this->parsed_url_.uri.c_str(), (unsigned) (backoff_ms / 1000));
     this->idle_delay_(backoff_ms);
   }
@@ -689,19 +689,23 @@ RtspMjpeg::OutputPlan RtspMjpeg::plan_output_(int src_width, int src_height) con
   plan.scaled_width = static_cast<int>(plan.scale * src_width);
   plan.scaled_height = static_cast<int>(plan.scale * src_height);
 #else
-  // esp_new_jpeg scales to any size down to 1/8, as long as each requested dimension is a multiple of 8
-  // (the source size doesn't matter). Ask for the smallest such size that still covers the target;
-  // finish_frame_() resizes the last few pixels. An axis that can't be reduced is left unscaled.
-  // (The old check required the *source* to divide by 16/32/64, so 1920x1080 was always decoded at
-  // full size into a 4 MB buffer per stream.)
-  auto pick = [](int src, int target) {
-    int want = std::max(target, (src + 7) / 8);  // the decoder reduces at most 1/8
-    want = (want + 7) / 8 * 8;                   // requested sizes must be multiples of 8
-    return want >= src ? src : want;
-  };
+  // esp_new_jpeg's scaler smears the picture at arbitrary ratios (seen with a 320x240 stream
+  // in the 320x200 single view: the decoder was asked for 272x200 and produced horizontal
+  // streaks, while the grid's exact 1:2 request was clean). Only ever ask the decoder for an
+  // exact 1:1, 1:2, 1:4 or 1:8 reduction — the same factor on both axes, and only when the
+  // source divides exactly — choosing the strongest reduction that still covers the target.
+  // finish_frame_() (halving + bilinear resize) covers the rest of the way to the target.
+  int factor = 1;
+  for (int f = 8; f >= 2; f /= 2) {
+    if (src_width % f == 0 && src_height % f == 0 && src_width / f >= plan.target_width &&
+        src_height / f >= plan.target_height) {
+      factor = f;
+      break;
+    }
+  }
   plan.scale = scale;
-  plan.scaled_width = pick(src_width, plan.target_width);
-  plan.scaled_height = pick(src_height, plan.target_height);
+  plan.scaled_width = src_width / factor;
+  plan.scaled_height = src_height / factor;
 #endif
   plan.stage_width = swap ? plan.scaled_height : plan.scaled_width;
   plan.stage_height = swap ? plan.scaled_width : plan.scaled_height;

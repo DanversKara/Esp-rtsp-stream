@@ -1,45 +1,77 @@
-# CCTV Box — ESP32-S3-BOX-3
+# CCTV Box v5 "NVR" — hybrid build
 
-Standalone 4-camera viewer and SD-card recorder, built with ESPHome + LVGL.
+4-camera viewer + SD-card recorder for the ESP32-S3-BOX-3
+(+ BOX-3-SENSOR base for the microSD slot). Supersedes v4.
 
-## What it does
-- **Home:** clock and a floating camera window. Drag it to move it, drag the amber corner to resize it, tap it to open that camera, X to hide it.
-- **CCTV:** one camera full width. **1–4** pick the camera, **REC** records it to the SD card, **FLOAT** pins it to the home window, **GRID** shows all four.
-- **Grid:** all four cameras 2×2. Tap one to open it; X goes back.
-- **Recording:** `/cctv/<YYYYMMDD_HHMMSS>_<NAME>.avi` on the card (Motion-JPEG AVI, plays in VLC). A new file starts every 5 minutes. The oldest files are deleted when free space drops below 1 GB.
-- **Home Assistant:** a *Record <camera>* switch for each camera, *Record All* / *Stop All* buttons, a floating window on/off switch and camera select, and SD free space / size / file count sensors.
+## How this build is put together
 
-Recording keeps working when a camera isn't on screen. It resumes after a reboot (it waits up to 90 s for the clock, because file names use the date).
+| Layer | Source |
+|---|---|
+| Hardware base (LCD, backlight, battery, speaker/mic, both I2C buses, WiFi + fallback AP, Bluetooth proxy, USB logging) | `Start_From_Scratch_Code.yaml`, kept whole — only its "READY" display lambda is dropped because LVGL owns the screen |
+| Stream/scale engine | `esp_rtsp_stream` upstream design: one 320x240 stream per camera, the decoder scales it to the canvas on screen |
+| HTTP MJPEG sessions, runtime canvas routing, idle disconnect, AVI recording, SD management | the cctv fork additions (v4 components, byte-identical in this zip) |
 
-## Hardware
-- ESP32-S3-BOX-3.
-- **Recording needs the BOX-3-SENSOR base**, which has the microSD slot. The plain BOX-3-DOCK has no slot; viewing still works without it.
-- microSD card formatted **FAT32**. Cards over 32 GB usually come as exFAT, so reformat them as FAT32 (for example with *guiformat* on Windows).
+## Screens (no floating windows anymore)
+
+- **Viewer = the home page.** One camera full-screen at 320x240 — exact 1:1
+  with the stream, no pillarbox, no stretch. Overlay buttons on the video:
+  **1 2 3 4** pick a camera, **REC** records the camera you're viewing,
+  **GRID** shows all four. Camera name, clock, REC badge and SD free space
+  are overlaid at the top.
+- **Grid.** All four cameras 2x2 at 160x120 — exact 1:2 scale of the same
+  streams (no second connection per camera). Tap a cell to open that camera
+  in the viewer; the red X returns to the viewer.
+- The physical red home button under the screen returns to the viewer.
 
 ## Cameras
-- MJPEG only, over HTTP (motionEye/motion streaming port, ESP32-CAM) or RTSP (camera sub-stream set to MJPEG). H.264/H.265 is not supported.
-- Keep streams small, ideally 320×240 to 640×480. 1080p works but is slow to show, and each frame is roughly 100 KB on the card.
 
-## Install (ESPHome add-on in Home Assistant)
-1. Copy `cctv-box.yaml` and the whole `components` folder into `/config/esphome/`:
-   ```
-   esphome/
-   ├── cctv-box.yaml
-   ├── secrets.yaml            (wifi_ssid, wifi_password, api_key)
-   └── components/
-       ├── esp_rtsp_stream/
-       └── cctv_sdcard/
-   ```
-2. Edit the `substitutions:` at the top of the YAML (camera URLs, names, frame rates).
-3. Install. Use USB for the first flash.
-
-## Settings worth knowing
-| Setting | Default | Notes |
+| # | Name | Source |
 |---|---|---|
-| `cctv_single_fps` / `cctv_grid_fps` | 4 / 2 | On-screen decode rate per camera |
-| `cctv_record_fps` | 2 | Frames written per second, per camera |
-| `cctv_record_segment` | 5min | Length of each file |
-| `min_free` (cctv_sdcard) | 1GB | Oldest recordings are deleted below this |
-| `keep_newest` | 8 | These files are never auto-deleted |
+| 1 | DOOR | `rtsp://192.168.8.230/live1` — direct from the camera, motionEye not involved |
+| 2 | WINDOW | motionEye `http://192.168.8.212:9084` |
+| 3 | PARKING LOT | motionEye `http://192.168.8.212:9085` |
+| 4 | DOOR 2 | motionEye `http://192.168.8.212:9081` (same picture as cam 1) |
 
-Space used: 1080p at 2 fps is about 0.7 GB per hour per camera; 640×480 at 2 fps is about 0.15 GB per hour.
+All URLs are the `camN_url` substitutions at the top of `cctv-box.yaml` —
+one line each, `rtsp://` and `http://` can be mixed. Cam 2's camera lives at
+192.168.8.223; if it serves the same `/live1` path, change `cam2_url` to
+`rtsp://192.168.8.223/live1` and it goes direct too.
+
+**RTSP warning:** this box decodes **MJPEG only** (RTP/JPEG). If a camera's
+`/live1` is H.264, that camera will sit at "Connecting..." and the log will
+show RTSP connecting but no frames ever decoding. Fixes: set that camera's
+stream/sub-stream encoding to MJPEG in its own settings, or point the box
+back at its motionEye HTTP port (which is MJPEG) — one line in the
+substitutions.
+
+## Recording
+
+- REC on the viewer, the Record switches / Record All button in Home
+  Assistant. Recordings keep running while a camera is off-screen and
+  resume automatically after a reboot.
+- Files: `/sdcard/cctv/<YYYYMMDD_HHMMSS>_<NAME>.avi`, Motion-JPEG AVI
+  (plays in VLC), 2 fps, split every 5 minutes. Recordings are the raw
+  stream frames, not the scaled screen picture.
+- When the card drops below 1 GB free, the oldest files are deleted
+  (the newest 8 are always kept). Card must be FAT32.
+
+## Deploy
+
+1. Back up your current ESPHome device folder.
+2. Unzip this over it (keep your existing `secrets.yaml` — it needs
+   `wifi_ssid`, `wifi_password`, `api_key`).
+3. `esphome run cctv-box.yaml` (or Upload in the ESPHome dashboard).
+4. First boot log lines to expect per camera:
+   `First frame: 320x240 stream -> 320x240 output` in the viewer and
+   `-> 160x120 output` in the grid.
+
+## Notes
+
+- Bluetooth proxy is kept from the scratch base. It shares the radio with
+  WiFi — if the grid stutters, comment out `esp32_ble_tracker:` /
+  `bluetooth_proxy:` in the YAML; nothing on the CCTV side uses it.
+- Speaker/mic/battery are kept from the scratch base so every piece of
+  hardware stays live and testable; the CCTV screens don't use audio.
+- Known upstream fault that this build routes around for cam 1 only:
+  motionEye still closes HTTP streams after ~10 s, so cams 2–4 can still
+  blink/reconnect in the grid until they're switched to direct RTSP too.
