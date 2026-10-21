@@ -1,3 +1,6 @@
+# View my other ESP32 Project Repo here
+- https://github.com/DanversKara/ESP32-S3-Box-3/tree/main/ESP32/ESP32-S3-Box-3/Firmware%20designed%20FreePBX%20or%20IncrediblePBX%20or%20Asterisk/VoIP%2BApps%2BKeypad-Pin_Code-Settings-Locks
+
 # CCTV Box — ESP32-S3-BOX-3
 
 Standalone 4-camera viewer and SD-card recorder, built with ESPHome + LVGL.
