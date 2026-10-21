@@ -2,6 +2,7 @@
 - found at https://github.com/DanversKara/ESP32-S3-Box-3/tree/main/ESP32/ESP32-S3-Box-3/Firmware%20designed%20FreePBX%20or%20IncrediblePBX%20or%20Asterisk/VoIP%2BApps%2BKeypad-Pin_Code-Settings-Locks now i have working faster video then my old video setup under archive folder.
 - also attached a video https://github.com/DanversKara/Esp-rtsp-stream/blob/main/Video.mp4
 - added 4 channel support and 4 floating window cams but 1 at a time to ESP project, ill later work on this form maybe add a cool CCTV interface... maybe a button to record to an NVR or SD CARD
+- you can control the cameras and floating windows from HA Devices and Service Panel so you dont need to touch ESP screen.
 
 # esp_rtsp_stream
 
