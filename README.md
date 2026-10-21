@@ -102,18 +102,7 @@ psram:
 
 The display section is the same as for the S3, typically with a `mipi_dsi` panel. For a portrait 800×1280 panel showing a landscape camera, use `rotation: 90` and `output_width: 800` / `output_height: 1280`.
 
-## C++ API
 
-- `draw(it)` / `draw(it, x, y)`: draw the newest frame.
-- `has_frame()`, `is_streaming()`, `get_frame_width()`, `get_frame_height()`
-- `get_frame_count()`, `get_dropped_frames()`, `get_last_decode_ms()`
-
-## Limitations
-
-- MJPEG only; no H.264/H.265.
-- RTP over TCP only. A camera that refuses TCP transport fails at SETUP.
-- 8-bit quantisation tables only; 16-bit tables are rare.
-- With LVGL, use `lvgl_canvas` (below), not a display lambda: LVGL owns the screen.
 
 ## LVGL
 
@@ -134,5 +123,16 @@ lvgl:
             width: 320
             height: 240
 ```
+## C++ API
 
+- `draw(it)` / `draw(it, x, y)`: draw the newest frame.
+- `has_frame()`, `is_streaming()`, `get_frame_width()`, `get_frame_height()`
+- `get_frame_count()`, `get_dropped_frames()`, `get_last_decode_ms()`
+
+## Limitations
+
+- MJPEG only; no H.264/H.265.
+- RTP over TCP only. A camera that refuses TCP transport fails at SETUP.
+- 8-bit quantisation tables only; 16-bit tables are rare.
+- With LVGL, use `lvgl_canvas` (below), not a display lambda: LVGL owns the screen.
 The frame is copied into the canvas from the main loop, which is safe for LVGL, and centred on it. While the canvas isn't on screen (another page is showing), frames are not decoded. The RTSP session stays connected, so the picture comes back instantly.
