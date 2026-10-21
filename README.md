@@ -1,8 +1,11 @@
 # esp_rtsp_stream
 
-ESPHome external component that shows an RTSP **MJPEG** camera stream (Hikvision, Dahua and other ONVIF-style IP cameras) on an ESP32-S3 or ESP32-P4 display.
+ESPHome external component that shows an RTSP **MJPEG** camera stream (like Hikvision, Dahua and other ONVIF-style IP cameras) on an ESP32-S3 or ESP32-P4 display.
 
-It does not decode H.264/H.265. Set the camera stream you use, normally the sub-stream, to **MJPEG**.
+## Prerequisite
+- **Dual Core** (currently ESP32-S3 S31 and P4 are equiped with this)
+- **PSRAM**
+- **MJPEG** stream configured on the camera, normally the sub-stream ( does not decode H.264/H.265 at this stage )
 
 ## How it works
 
